@@ -1,0 +1,88 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# Node & Frontend
+node_modules/
+frontend/dist/
+frontend/node_modules/
+.npm
+.yarn/
+*.log
+
+# Environment & secrets
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+
+# Storage & Runtime data
+storage/temp/*
+storage/output/*
+storage/db/*
+storage/e2e/
+storage/*.db
+storage/*.sqlite
+*.db
+*.sqlite
+*.sqlite3
+!storage/temp/.gitkeep
+!storage/output/.gitkeep
+!storage/db/.gitkeep
+
+# Releases & Archives
+releases/
+*.zip
+*.tar.gz
+
+# Local bundled tools (e.g. FFmpeg binaries)
+tools/
+
+# IDE & Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS artifacts
+.DS_Store
+Thumbs.db
+ehthumbs.db
+[Dd]esktop.ini
+
+# Testing & Linting
+.coverage
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/

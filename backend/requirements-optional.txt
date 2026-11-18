@@ -1,0 +1,2 @@
+# Optional: YouTube/Twitch import (POST /api/videos/import-url), public videos you are authorized to use
+yt-dlp>=2024.8
