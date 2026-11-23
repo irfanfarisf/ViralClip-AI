@@ -6,9 +6,10 @@
 """
 import asyncio
 import shutil
+import time
 import uuid
 from pathlib import Path
-from typing import Optional
+from typing import Dict, Optional
 
 from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse
@@ -28,6 +29,7 @@ from backend.app.schemas.video import (
 )
 
 router = APIRouter(prefix="/videos", tags=["Videos"])
+_upload_db_flush: Dict[str, tuple[float, int]] = {}  # upload_id -> (monotonic_time, last_pct)
 
 
 def video_payload(video: Video, job_id: str | None = None, extra: dict | None = None) -> dict:
@@ -117,7 +119,9 @@ async def init_upload(req: ChunkedUploadInitRequest, db: AsyncSession = Depends(
     g_key = req.gemini_api_key
     o_key = req.openai_api_key
     opts = {k: v for k, v in {
+        "language": req.language,
         "whisper_model": req.whisper_model,
+        "transcription_profile": req.transcription_profile,
         "auto_analyze": req.auto_analyze,
     }.items() if v is not None}
 
@@ -169,12 +173,17 @@ async def init_upload(req: ChunkedUploadInitRequest, db: AsyncSession = Depends(
         db.add(job)
         await db.commit()
     else:
+        resume_tel = {"import_state": "UPLOADING", "can_resume": True}
+        if req.language is not None:
+            resume_tel["language"] = req.language
+        if req.whisper_model is not None:
+            resume_tel["whisper_model"] = req.whisper_model
         await job_runner.set_job(
             job_id,
             status="uploading",
             stage="UPLOADING: Resumed chunked upload",
             error="",
-            telemetry={"import_state": "UPLOADING", "can_resume": True},
+            telemetry=resume_tel,
         )
 
     received_indices = sorted(int(k) for k in session.get("received_chunks", {}).keys())
@@ -231,22 +240,28 @@ async def upload_chunk(
     eta_str = f", ETA {int(res['eta_seconds'])}s" if res.get("eta_seconds") is not None else ""
     stage_label = f"UPLOADING: {mb_done:.1f}/{mb_tot:.1f} MB ({mb_s:.1f} MB/s{eta_str})"
 
-    await job_runner.set_job(
-        res["job_id"],
-        status="UPLOADING",
-        progress=res["progress"],
-        stage=stage_label,
-        telemetry={
-            "import_state": "UPLOADING",
-            "bytes_transferred": res["bytes_received"],
-            "total_bytes": res["total_bytes"],
-            "speed_bps": res["speed_bps"],
-            "eta_seconds": res["eta_seconds"],
-            "chunks_received": res["chunks_received"],
-            "total_chunks": res["total_chunks"],
-            "can_resume": True,
-        },
-    )
+    # Throttle SQLite commits during rapid chunked uploads (flush on first chunk, final chunk, >=1s, or >=5% jump)
+    now_m = time.monotonic()
+    last_t, last_pct = _upload_db_flush.get(upload_id, (0.0, -1))
+    is_boundary = res["chunks_received"] <= 1 or res["chunks_received"] >= res["total_chunks"]
+    if is_boundary or (now_m - last_t) >= 1.0 or (res["progress"] - last_pct) >= 5:
+        _upload_db_flush[upload_id] = (now_m, res["progress"])
+        await job_runner.set_job(
+            res["job_id"],
+            status="UPLOADING",
+            progress=res["progress"],
+            stage=stage_label,
+            telemetry={
+                "import_state": "UPLOADING",
+                "bytes_transferred": res["bytes_received"],
+                "total_bytes": res["total_bytes"],
+                "speed_bps": res["speed_bps"],
+                "eta_seconds": res["eta_seconds"],
+                "chunks_received": res["chunks_received"],
+                "total_chunks": res["total_chunks"],
+                "can_resume": True,
+            },
+        )
     return res
 
 
@@ -359,12 +374,14 @@ async def complete_upload(
         o_key = session.get("openai_api_key") or sess_opts.get("openai_api_key")
         job_runner.start_pipeline(job_id, gemini_api_key=g_key, openai_api_key=o_key)
 
+    _upload_db_flush.pop(upload_id, None)
     return video_payload(video, job_id, {"import_state": "COMPLETED", "auto_analyze": bool(auto_analyze)})
 
 
 @router.delete("/upload/{upload_id}")
 async def cancel_upload_session(upload_id: str, db: AsyncSession = Depends(get_db)):
     """Cancel an in-progress chunked upload and safely remove its temporary .uploading.part file."""
+    _upload_db_flush.pop(upload_id, None)
     res = await asyncio.to_thread(vi.cancel_chunked_upload, upload_id)
     job_id = res.get("job_id")
     if job_id:
@@ -443,6 +460,7 @@ async def import_url(req: VideoImportUrlRequest, db: AsyncSession = Depends(get_
     opts = {k: v for k, v in {
         "language": req.language,
         "whisper_model": req.whisper_model,
+        "transcription_profile": req.transcription_profile,
         "auto_analyze": req.auto_analyze,
         "source_url": clean_url,
     }.items() if v is not None}
@@ -500,7 +518,23 @@ async def import_url(req: VideoImportUrlRequest, db: AsyncSession = Depends(get_
     )
     db.add(job)
     await db.commit()
-    job_runner.start_url_import(job.id, clean_url, gemini_api_key=req.gemini_api_key, openai_api_key=req.openai_api_key)
+    started = job_runner.start_url_import(job.id, clean_url, gemini_api_key=req.gemini_api_key, openai_api_key=req.openai_api_key)
+    if not started:
+        # Another concurrent request won the race between check and commit: remove duplicate stub and return winner
+        winner_jid = job_runner.get_active_url_job(clean_url)
+        await db.delete(video)
+        await db.commit()
+        shutil.rmtree(dest_dir, ignore_errors=True)
+        if winner_jid:
+            winner_job = await db.get(Job, winner_jid)
+            if winner_job:
+                winner_vid = await db.get(Video, winner_job.video_id)
+                if winner_vid:
+                    return video_payload(
+                        winner_vid,
+                        winner_job.id,
+                        {"import_state": winner_job.status, "duplicate_prevented": True},
+                    )
     return video_payload(video, job.id, {"import_state": "QUEUED", "duplicate_prevented": False})
 
 

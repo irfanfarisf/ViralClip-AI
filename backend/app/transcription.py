@@ -35,7 +35,55 @@ class TranscriptionError(RuntimeError):
 
 
 _models: Dict[str, Tuple[Any, dict]] = {}
+_pipelines_by_model: Dict[int, Any] = {}
+_model_lru: List[str] = []
+_MAX_CACHED_MODELS = 2
 _models_lock = threading.Lock()
+
+TRANSCRIPTION_PROFILES: Dict[str, Dict[str, Any]] = {
+    "speed": {
+        "label": "Speed",
+        "description": "Fastest CPU inference (batched beam=1, best_of=1). Slight accuracy trade-off on complex or non-English speech.",
+        "use_batched": True,
+        "multilingual_use_batched": True,
+        "batch_size": 8,
+        "beam_size": 1,
+        "best_of": 1,
+        "temperature": 0.0,
+        "vad_filter": True,
+        "word_timestamps": True,
+    },
+    "balanced": {
+        "label": "Balanced",
+        "description": "Recommended default: batched beam=1 for English (~28-30x RT) and beam=2 unbatched for non-English to preserve multilingual quality.",
+        "use_batched": True,
+        "multilingual_use_batched": False,
+        "batch_size": 4,
+        "beam_size": 1,
+        "multilingual_beam_size": 2,
+        "best_of": 1,
+        "temperature": (0.0, 0.2),
+        "vad_filter": True,
+        "word_timestamps": True,
+    },
+    "accuracy": {
+        "label": "Accuracy",
+        "description": "Highest transcription accuracy (beam=3, best_of=2, multi-temperature fallback). Slower on long videos.",
+        "use_batched": False,
+        "multilingual_use_batched": False,
+        "batch_size": 1,
+        "beam_size": 3,
+        "best_of": 2,
+        "temperature": (0.0, 0.2, 0.4),
+        "vad_filter": True,
+        "word_timestamps": True,
+    },
+}
+
+
+def normalize_profile(profile: Optional[str]) -> str:
+    p = (profile or getattr(settings, "WHISPER_PROFILE", "balanced") or "balanced").strip().lower()
+    return p if p in TRANSCRIPTION_PROFILES else "balanced"
 
 
 def whisper_available() -> bool:
@@ -43,13 +91,46 @@ def whisper_available() -> bool:
     return importlib.util.find_spec("faster_whisper") is not None
 
 
+def _detect_windows_cpu_and_gpu() -> Tuple[str, Optional[str]]:
+    cpu_name = os.environ.get("PROCESSOR_IDENTIFIER") or ""
+    amd_gpu: Optional[str] = None
+    if os.name == "nt":
+        try:
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"HARDWARE\DESCRIPTION\System\CentralProcessor\0") as k:
+                val, _ = winreg.QueryValueEx(k, "ProcessorNameString")
+                if val:
+                    cpu_name = str(val).strip()
+            cls_path = r"SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}"
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, cls_path) as cls_k:
+                for idx in range(16):
+                    try:
+                        sub_name = winreg.EnumKey(cls_k, idx)
+                    except OSError:
+                        break
+                    try:
+                        with winreg.OpenKey(cls_k, sub_name) as sk:
+                            desc, _ = winreg.QueryValueEx(sk, "DriverDesc")
+                            desc_s = str(desc).strip()
+                            if "radeon" in desc_s.lower() or "amd" in desc_s.lower():
+                                amd_gpu = desc_s
+                                break
+                    except OSError:
+                        continue
+        except Exception:
+            pass
+    return cpu_name or "CPU", amd_gpu
+
+
 def optimal_cpu_threads() -> int:
     configured = int(getattr(settings, "WHISPER_CPU_THREADS", 0) or 0)
     if configured > 0:
         return configured
     logical = os.cpu_count() or 4
-    # Leave 1-2 threads free for FastAPI/OS responsiveness on a 16 GB Windows 11 machine
-    return max(2, min(8, logical - 1 if logical > 2 else logical))
+    # Match physical core count (e.g. 6 threads on a 6C/12T Ryzen 5 5625U) to avoid SMT contention & keep FastAPI responsive
+    if logical >= 8:
+        return max(4, min(6, logical // 2))
+    return max(2, logical - 1 if logical > 2 else logical)
 
 
 def detect_whisper_hardware(
@@ -60,6 +141,7 @@ def detect_whisper_hardware(
     req_dev = (requested_device or settings.WHISPER_DEVICE or "auto").strip().lower()
     req_comp = (requested_compute or settings.WHISPER_COMPUTE_TYPE or "auto").strip().lower()
 
+    cpu_name, amd_gpu = _detect_windows_cpu_and_gpu()
     cuda_count = 0
     supported_cuda_types: set[str] = set()
     try:
@@ -86,17 +168,28 @@ def detect_whisper_hardware(
             "cpu_threads": 0,
             "gpu_accelerated": True,
             "cuda_device_count": cuda_count,
+            "cpu_name": cpu_name,
+            "amd_gpu": amd_gpu,
+            "backend_note": "NVIDIA CUDA GPU acceleration active.",
             "label": f"NVIDIA CUDA GPU ({comp})",
         }
 
     threads = optimal_cpu_threads()
     comp = req_comp if req_comp not in ("auto", "", "float16") else "int8"
+    note = (
+        f"Using CPU ({comp}, {threads} threads) on {cpu_name}. "
+        + (f"Detected {amd_gpu}: used for AMF video export; CTranslate2/faster-whisper has no AMD DirectML/ROCm backend on Windows."
+           if amd_gpu else "No CUDA GPU detected.")
+    )
     return {
         "device": "cpu",
         "compute_type": comp,
         "cpu_threads": threads,
         "gpu_accelerated": False,
         "cuda_device_count": cuda_count,
+        "cpu_name": cpu_name,
+        "amd_gpu": amd_gpu,
+        "backend_note": note,
         "label": f"CPU ({comp}, {threads} threads)",
     }
 
@@ -109,6 +202,23 @@ def get_model(
     """Retrieve or load a cached WhisperModel instance by configuration key."""
     info = get_model_with_info(model_name, device=device, compute_type=compute_type)
     return info[0]
+
+
+def _get_batched_pipeline(model: Any) -> Optional[Any]:
+    """Return a cached BatchedInferencePipeline for a real WhisperModel, or None for test doubles."""
+    try:
+        from faster_whisper import BatchedInferencePipeline, WhisperModel
+    except ImportError:
+        return None
+    if not isinstance(model, WhisperModel):
+        return None
+    mid = id(model)
+    with _models_lock:
+        pipe = _pipelines_by_model.get(mid)
+        if pipe is None:
+            pipe = BatchedInferencePipeline(model=model)
+            _pipelines_by_model[mid] = pipe
+        return pipe
 
 
 def get_model_with_info(
@@ -134,7 +244,13 @@ def get_model_with_info(
                     kwargs["cpu_threads"] = hw["cpu_threads"]
                     kwargs["num_workers"] = 1
                 model_inst = WhisperModel(name, **kwargs)
+                if len(_model_lru) >= _MAX_CACHED_MODELS:
+                    evict_key = _model_lru.pop(0)
+                    evicted = _models.pop(evict_key, None)
+                    if evicted:
+                        _pipelines_by_model.pop(id(evicted[0]), None)
                 _models[key] = (model_inst, hw)
+                _model_lru.append(key)
             except Exception as exc:
                 if hw["device"] == "cuda":
                     log.warning("CUDA Whisper initialization failed (%s); falling back to CPU int8", exc)
@@ -148,11 +264,21 @@ def get_model_with_info(
                             cpu_threads=cpu_hw["cpu_threads"],
                             num_workers=1,
                         )
+                        if len(_model_lru) >= _MAX_CACHED_MODELS:
+                            evict_key = _model_lru.pop(0)
+                            evicted = _models.pop(evict_key, None)
+                            if evicted:
+                                _pipelines_by_model.pop(id(evicted[0]), None)
                         _models[cpu_key] = (model_inst, cpu_hw)
+                        _model_lru.append(cpu_key)
                     return _models[cpu_key]
                 raise TranscriptionError(
                     f"Could not load Whisper model '{name}' ({hw['label']}): {exc}"
                 ) from exc
+        else:
+            if key in _model_lru:
+                _model_lru.remove(key)
+            _model_lru.append(key)
         return _models[key]
 
 
@@ -237,6 +363,23 @@ def load_wav_float32(wav_path: str) -> np.ndarray:
     return read_wav_window_float32(wav_path, 0.0, 0.0)
 
 
+def validate_language(language: Optional[str]) -> Optional[str]:
+    """Normalize a user-provided language code/name and validate against Whisper supported languages."""
+    if not language or not str(language).strip():
+        return None
+    from backend.app.translation import normalize_language_code
+    norm = normalize_language_code(str(language))
+    if norm in ("auto", "none", "detect", ""):
+        return None
+    try:
+        from faster_whisper.tokenizer import _LANGUAGE_CODES
+        if _LANGUAGE_CODES and norm not in _LANGUAGE_CODES:
+            raise TranscriptionError(f"Unsupported spoken language '{language}' (normalized: '{norm}').")
+    except ImportError:
+        pass
+    return norm
+
+
 def transcribe_audio(
     wav_path: str,
     duration: float,
@@ -252,6 +395,7 @@ def transcribe_audio(
     resume_from_sec: float = 0.0,
     initial_segments: Optional[List[dict]] = None,
     window_seconds: Optional[float] = None,
+    profile: Optional[str] = None,
 ) -> TranscriptionResult:
     """Run windowed faster-whisper speech transcription on a 16 kHz mono WAV file.
 
@@ -259,14 +403,13 @@ def transcribe_audio(
     3-4 hour videos consume < 40 MB of audio buffer RAM, emit real-time progress immediately,
     and save intermediate checkpoints for crash/restart recovery.
     """
+    norm_lang = validate_language(language)
+    eff_profile = normalize_profile(profile)
+    prof_cfg = TRANSCRIPTION_PROFILES[eff_profile]
     effective_model = (model_name or settings.WHISPER_MODEL or "base").strip().lower()
     model, hw = get_model_with_info(effective_model, device=device, compute_type=compute_type)
-    beam_sz = max(1, min(int(getattr(settings, "WHISPER_BEAM_SIZE", 2) or 2), 5))
+    batched_pipe = _get_batched_pipeline(model)
     win_sec = float(window_seconds or getattr(settings, "WHISPER_CHUNK_SECONDS", 600) or 600.0)
-
-    norm_lang = language.strip().lower() if language and language.strip() else None
-    if norm_lang in ("auto", "none", "detect"):
-        norm_lang = None
 
     try:
         wav_dur = get_wav_duration(wav_path)
@@ -276,8 +419,9 @@ def transcribe_audio(
         if out and start_offset <= 0.0:
             start_offset = max(float(s.get("end", 0.0)) for s in out)
 
-        detected_lang = norm_lang
-        lang_prob = 1.0 if norm_lang else 0.0
+        locked_lang: Optional[str] = norm_lang
+        lang_votes: Dict[str, float] = {}
+        lang_probs: Dict[str, List[float]] = {}
         t0 = time.perf_counter()
 
         def _emit_telemetry(transcribed_sec: float, current_text: Optional[str] = None) -> None:
@@ -296,7 +440,9 @@ def transcribe_audio(
                     "total_audio_seconds": round(total_dur, 2),
                     "progress_fraction": round(frac, 4),
                     "progress_percent": round(frac * 100.0, 1),
+                    "elapsed_seconds": round(elapsed, 1),
                     "whisper_model": effective_model,
+                    "whisper_profile": eff_profile,
                     "whisper_device": hw["label"],
                     "gpu_accelerated": hw["gpu_accelerated"],
                     "realtime_factor": round(rtf, 2),
@@ -322,18 +468,55 @@ def transcribe_audio(
             if audio_slice.size == 0:
                 break
 
-            segments_gen, info = model.transcribe(
-                audio_slice,
-                language=detected_lang,
-                word_timestamps=True,
-                vad_filter=True,
-                beam_size=beam_sz,
-                condition_on_previous_text=False,
-            )
+            # Gracefully skip completely silent slices without triggering language misdetection or hallucinations
+            if float(np.max(np.abs(audio_slice))) < 1e-4:
+                cur_win_end = wav_dur if is_last else min(nominal_end, wav_dur)
+                _emit_telemetry(cur_win_end)
+                if checkpoint_cb:
+                    checkpoint_cb(out, cur_win_end)
+                del audio_slice
+                cur_win_start = cur_win_end
+                continue
 
-            if detected_lang is None:
-                detected_lang = getattr(info, "language", None)
-                lang_prob = float(getattr(info, "language_probability", 0.0) or 0.0)
+            is_non_english = locked_lang is not None and locked_lang != "en"
+            use_batched = (
+                bool(prof_cfg.get("multilingual_use_batched", False))
+                if is_non_english
+                else bool(prof_cfg.get("use_batched", True))
+            )
+            beam_sz = int(
+                prof_cfg.get("multilingual_beam_size", prof_cfg["beam_size"])
+                if is_non_english
+                else prof_cfg["beam_size"]
+            )
+            transcribe_kwargs: Dict[str, Any] = {
+                "language": locked_lang,
+                "task": "transcribe",  # Always transcribe in original spoken language; never translate to English
+                "word_timestamps": bool(prof_cfg.get("word_timestamps", True)),
+                "vad_filter": bool(prof_cfg.get("vad_filter", True)),
+                "vad_parameters": {
+                    "min_silence_duration_ms": 700,
+                    "min_speech_duration_ms": 150,
+                    "speech_pad_ms": 400,
+                    "threshold": 0.45,
+                },
+                "beam_size": max(1, beam_sz),
+                "best_of": int(prof_cfg.get("best_of", 1)),
+                "temperature": prof_cfg.get("temperature", 0.0),
+                "condition_on_previous_text": False,
+            }
+            if locked_lang is None:
+                transcribe_kwargs["language_detection_segments"] = 3
+
+            if use_batched and batched_pipe is not None and cur_win_len >= 10.0:
+                transcribe_kwargs["batch_size"] = int(prof_cfg.get("batch_size", 4))
+                transcribe_kwargs["without_timestamps"] = False
+                segments_gen, info = batched_pipe.transcribe(audio_slice, **transcribe_kwargs)
+            else:
+                segments_gen, info = model.transcribe(audio_slice, **transcribe_kwargs)
+
+            win_segs_count = 0
+            win_speech_dur = 0.0
 
             for seg in segments_gen:
                 if should_cancel and should_cancel():
@@ -349,23 +532,29 @@ def transcribe_audio(
                 # Prevent duplicate overlapping segments at window boundaries
                 if out and seg_end <= out[-1]["end"] + 0.05:
                     continue
+                if out and seg_start < out[-1]["end"]:
+                    seg_start = round(out[-1]["end"], 3)
+                    if seg_end <= seg_start:
+                        continue
+
+                text = seg.text.strip()
+                if not text:
+                    continue
 
                 words = []
+                prev_w_end = seg_start
                 for w in (seg.words or []):
                     cleaned_word = w.word.strip()
                     if cleaned_word:
-                        w_start = round(cur_win_start + max(float(w.start), 0.0), 3)
+                        w_start = round(max(cur_win_start + max(float(w.start), 0.0), prev_w_end), 3)
                         w_end = round(max(cur_win_start + float(w.end), w_start), 3)
+                        prev_w_end = w_end
                         words.append({
                             "word": cleaned_word,
                             "start": w_start,
                             "end": w_end,
                             "probability": round(min(max(float(w.probability or 0.0), 0.0), 1.0), 3),
                         })
-
-                text = seg.text.strip()
-                if not text:
-                    continue
 
                 conf = float(np.exp(seg.avg_logprob)) if seg.avg_logprob is not None else 0.0
                 out.append({
@@ -375,8 +564,23 @@ def transcribe_audio(
                     "confidence": round(min(max(conf, 0.0), 1.0), 3),
                     "words": words,
                 })
+                win_segs_count += 1
+                win_speech_dur += max(0.0, seg_end - seg_start)
                 last_accepted_end = seg_end
                 _emit_telemetry(seg_end, text)
+
+            # Vote / lock detected language only when backed by real speech (avoid locking on silence or brief English intro)
+            if norm_lang is None and locked_lang is None:
+                win_lang = getattr(info, "language", None)
+                win_prob = float(getattr(info, "language_probability", 0.0) or 0.0)
+                if win_lang and win_segs_count > 0:
+                    weight = max(win_speech_dur, 0.5) * max(win_prob, 0.1)
+                    lang_votes[win_lang] = lang_votes.get(win_lang, 0.0) + weight
+                    lang_probs.setdefault(win_lang, []).append(win_prob)
+                    if (win_lang != "en" and win_prob >= 0.72 and win_speech_dur >= 2.0) or (
+                        win_lang == "en" and win_prob >= 0.85 and win_speech_dur >= 5.0
+                    ):
+                        locked_lang = win_lang
 
             if is_last:
                 cur_win_end = wav_dur
@@ -390,14 +594,29 @@ def transcribe_audio(
             del audio_slice
             cur_win_start = cur_win_end
 
+        if norm_lang is not None:
+            final_lang: Optional[str] = norm_lang
+            final_prob = 1.0
+        elif locked_lang is not None:
+            final_lang = locked_lang
+            probs = lang_probs.get(locked_lang) or [0.0]
+            final_prob = sum(probs) / len(probs)
+        elif lang_votes:
+            final_lang = max(lang_votes, key=lambda k: lang_votes[k])
+            probs = lang_probs.get(final_lang) or [0.0]
+            final_prob = sum(probs) / len(probs)
+        else:
+            final_lang = None
+            final_prob = 0.0
+
         total_elapsed = max(time.perf_counter() - t0, 0.001)
         avg_rtf = max(wav_dur - start_offset, 0.0) / total_elapsed
         _emit_telemetry(total_dur)
 
         return TranscriptionResult(
             segments=out,
-            language=detected_lang or "en",
-            language_probability=lang_prob or 1.0,
+            language=final_lang,
+            language_probability=final_prob,
             duration=wav_dur,
             model_name=effective_model,
             device_label=hw["label"],
@@ -415,17 +634,27 @@ def transcribe_audio(
 
 
 def compute_energy(wav_path: str, window: float = 0.5) -> List[float]:
-    """Streamed RMS loudness per `window` seconds from a 16-bit mono WAV (constant < 1 MB RAM)."""
+    """Streamed vectorized RMS loudness per `window` seconds from a 16-bit mono WAV (< 2 MB RAM)."""
     with wave.open(wav_path, "rb") as wf:
         rate, n = wf.getframerate(), wf.getnframes()
         if wf.getsampwidth() != 2 or n == 0:
             return []
         step = max(int(rate * window), 1)
+        # Process 120 windows (~60s) per read for ~30x lower Python loop overhead
+        batch_windows = 120
+        batch_frames = step * batch_windows
         out: List[float] = []
         while True:
-            raw = wf.readframes(step)
+            raw = wf.readframes(batch_frames)
             if not raw:
                 break
-            samples = np.frombuffer(raw, dtype=np.int16).astype(np.float64)
-            out.append(float(np.sqrt(np.mean(samples ** 2))) / 32768.0 if samples.size else 0.0)
-        return [round(v, 5) for v in out]
+            samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+            full_wins = samples.size // step
+            if full_wins > 0:
+                blocks = samples[:full_wins * step].reshape(full_wins, step)
+                rms = np.sqrt(np.mean(blocks * blocks, axis=1, dtype=np.float64))
+                out.extend(np.round(rms, 5).tolist())
+            rem = samples[full_wins * step:]
+            if rem.size > 0:
+                out.append(round(float(np.sqrt(np.mean(rem * rem, dtype=np.float64))), 5))
+        return out

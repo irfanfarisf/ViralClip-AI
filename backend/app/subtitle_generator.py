@@ -126,6 +126,7 @@ class SubtitleStyle:
     has_background: bool = False
     background_color: str = "#000000"
     background_alpha: float = 0.65
+    enabled: bool = True
     language: Optional[str] = None
     subtitle_language: Optional[str] = None
     translated_words: Optional[List[dict]] = None
@@ -157,6 +158,7 @@ class SubtitleStyle:
             "backgroundAlpha": "background_alpha",
             "subtitleLanguage": "subtitle_language",
             "translatedWords": "translated_words",
+            "showSubtitles": "enabled",
         }
 
         # Size string presets from frontend: sm=62, md=72, lg=82, xl=92
@@ -192,7 +194,9 @@ class SubtitleStyle:
             if k in fields and v is not None:
                 t_str = str(fields[k].type)
                 try:
-                    if "int" in t_str and "float" not in t_str:
+                    if isinstance(v, (list, dict)) or "List" in t_str or "Dict" in t_str:
+                        kwargs[k] = v
+                    elif "int" in t_str and "float" not in t_str:
                         kwargs[k] = int(round(float(v)))
                     elif "float" in t_str:
                         kwargs[k] = float(v)
@@ -229,25 +233,40 @@ def _esc(text: str) -> str:
 
 def collect_translated_words(translated_words: List[dict], start: float, end: float) -> List[dict]:
     """Shift and clamp translated words relative to the clip window [start, end]."""
-    words = []
+    if not translated_words:
+        return []
     dur = max(end - start, 0.1)
-    for w in translated_words:
+
+    # Determine whether the entire word list is already clip-relative (0..dur)
+    # rather than in absolute video timeline seconds [start..end].
+    valid_items = [w for w in translated_words if isinstance(w, dict) and w.get("word")]
+    if not valid_items:
+        return []
+
+    has_absolute_match = any(
+        float(w.get("end", 0.0)) > start + 0.01 and float(w.get("start", 0.0)) < end - 0.01
+        for w in valid_items
+    )
+    all_clip_relative = (
+        start > 1.0
+        and not has_absolute_match
+        and all(0.0 <= float(w.get("start", 0.0)) < dur and float(w.get("end", 0.0)) <= dur + 0.5 for w in valid_items)
+    )
+
+    words: List[dict] = []
+    for w in valid_items:
         w_start = float(w.get("start", 0.0))
         w_end = float(w.get("end", 0.0))
-        # Case A: words are already relative to clip start (0.0 to dur)
-        if 0.0 <= w_start < dur and w_end <= dur + 1.0:
-            words.append({
-                "word": w["word"],
-                "start": max(w_start, 0.0),
-                "end": min(w_end, dur),
-            })
-        # Case B: words are in absolute timeline seconds [start, end]
-        elif w_start >= start - 0.05 and w_end <= end + 0.05:
-            words.append({
-                "word": w["word"],
-                "start": max(w_start - start, 0.0),
-                "end": min(w_end - start, dur),
-            })
+        if all_clip_relative:
+            s_rel = max(w_start, 0.0)
+            e_rel = min(w_end, dur)
+            if e_rel > s_rel:
+                words.append({"word": w["word"], "start": round(s_rel, 3), "end": round(e_rel, 3)})
+        elif w_end > start + 0.01 and w_start < end - 0.01:
+            s_rel = max(w_start - start, 0.0)
+            e_rel = min(w_end - start, dur)
+            if e_rel > s_rel:
+                words.append({"word": w["word"], "start": round(s_rel, 3), "end": round(e_rel, 3)})
     return words
 
 
@@ -272,12 +291,15 @@ def collect_words(segments: List[dict], start: float, end: float) -> List[dict]:
                 for i, t in enumerate(toks)
             ]
         for w in seg_words:
-            if w["start"] >= start - 0.05 and w["end"] <= end + 0.05:
-                words.append({
-                    "word": w["word"],
-                    "start": max(w["start"] - start, 0.0),
-                    "end": min(w["end"] - start, end - start),
-                })
+            if w["end"] > start + 0.01 and w["start"] < end - 0.01:
+                w_s = max(w["start"] - start, 0.0)
+                w_e = min(w["end"] - start, end - start)
+                if w_e > w_s:
+                    words.append({
+                        "word": w["word"],
+                        "start": w_s,
+                        "end": w_e,
+                    })
     return words
 
 
@@ -285,11 +307,14 @@ def chunk_words(words: List[dict], style: SubtitleStyle) -> List[List[dict]]:
     chunks: List[List[dict]] = []
     cur: List[dict] = []
     for w in words:
+        cur_chars = sum(len(x.get("word", "")) for x in cur) + len(cur)
+        next_len = len(w.get("word", ""))
         if cur and (
             len(cur) >= style.max_words
             or w["end"] - cur[0]["start"] > style.max_chunk_seconds
             or w["start"] - cur[-1]["end"] > 0.75
-            or re.search(r"[.!?]$", cur[-1]["word"])
+            or (cur_chars + next_len > 36 and len(cur) >= 2)
+            or re.search(r"[.!?।؟。！？]$", cur[-1]["word"])
         ):
             chunks.append(cur)
             cur = []
@@ -329,8 +354,8 @@ def generate_ass(words: List[dict], style: Optional[SubtitleStyle] = None) -> st
     if not words and st.translated_words:
         words = list(st.translated_words)
 
-    # Detect script and resolve appropriate Unicode font (e.g. Nirmala UI for Malayalam/Indic)
-    sample_text = " ".join(w.get("word", "") for w in words[:20]) if words else ""
+    # Detect script across the entire clip and resolve appropriate Unicode font (e.g. Nirmala UI for Malayalam/Indic)
+    sample_text = " ".join(w.get("word", "") for w in words) if words else ""
     resolved_font = resolve_font_for_script(sample_text, st.font)
 
     # Determine vertical alignment and margin
@@ -381,24 +406,51 @@ def generate_ass(words: List[dict], style: Optional[SubtitleStyle] = None) -> st
     open_tag, close_tag = _get_active_word_tags(st, hi_col, base_col)
 
     lines = []
-    for chunk in chunk_words(words, st):
+    chunks = chunk_words(words, st)
+    last_end = 0.0
+    for c_idx, chunk in enumerate(chunks):
+        next_chunk_start = chunks[c_idx + 1][0]["start"] if c_idx + 1 < len(chunks) else None
+        is_rtl = any(detect_script(cw["word"]) == "arabic" for cw in chunk)
         for i, w in enumerate(chunk):
-            t0 = w["start"]
-            t1 = chunk[i + 1]["start"] if i + 1 < len(chunk) else max(w["end"], t0 + 0.12)
-            if t1 <= t0:
-                continue
-            parts = []
-            for j, cw in enumerate(chunk):
+            t0 = max(w["start"], last_end)
+            raw_t1 = chunk[i + 1]["start"] if i + 1 < len(chunk) else max(w["end"], t0 + 0.12)
+            if i == len(chunk) - 1 and next_chunk_start is not None:
+                raw_t1 = min(raw_t1, max(next_chunk_start, t0 + 0.05))
+            t1 = max(raw_t1, t0 + 0.05)
+            last_end = t1
+            def _fmt_word(cw: dict) -> str:
                 w_str = cw["word"]
+                w_script = detect_script(w_str)
                 # Only apply uppercase to Latin text to prevent breaking Indic/complex script conjuncts
-                if st.uppercase and detect_script(w_str) == "latin":
+                if st.uppercase and w_script == "latin":
                     w_str = w_str.upper()
                 txt = _esc(w_str)
-                if j == i:
-                    parts.append(f"{open_tag}{txt}{close_tag}")
-                else:
-                    parts.append(txt)
-            lines.append(f"Dialogue: 0,{_ts(t0)},{_ts(t1)},Default,,0,0,0,,{' '.join(parts)}")
+                if w_script != "latin":
+                    w_font = resolve_font_for_script(w_str, resolved_font)
+                    if w_font != resolved_font:
+                        return f"{{\\fn{_esc(w_font)}}}{txt}{{\\fn{_esc(resolved_font)}}}"
+                return txt
+
+            if is_rtl:
+                # In libass, each inline override block starts an LTR-ordered visual run while
+                # FriBidi shapes text inside each run RTL. Place post-active words on the left,
+                # active word in the middle, and pre-active words on the right so visual order
+                # reads strictly right-to-left with the highlight advancing right-to-left.
+                formatted = [_fmt_word(cw) for cw in chunk]
+                left_run = " ".join(formatted[i + 1 :])
+                active_run = f"{open_tag}{formatted[i]}{close_tag}"
+                right_run = " ".join(formatted[:i])
+                line_text = " ".join(p for p in (left_run, active_run, right_run) if p)
+            else:
+                parts = []
+                for j, cw in enumerate(chunk):
+                    txt = _fmt_word(cw)
+                    if j == i:
+                        parts.append(f"{open_tag}{txt}{close_tag}")
+                    else:
+                        parts.append(txt)
+                line_text = " ".join(parts)
+            lines.append(f"Dialogue: 0,{_ts(t0)},{_ts(t1)},Default,,0,0,0,,{line_text}")
 
     return header + "\n".join(lines) + ("\n" if lines else "")
 

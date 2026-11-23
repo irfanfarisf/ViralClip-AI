@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   Type,
   Sparkles,
@@ -14,8 +14,11 @@ import {
   Languages,
   Loader2,
   RotateCcw,
+  AlertCircle,
+  CheckCircle2,
 } from 'lucide-react';
 import { useApp } from '../../context/AppContext';
+import { updateClipOnBackend } from '../../services/api';
 import { SUPPORTED_LANGUAGES, type SubtitlePreset, type SubtitleAnimation } from '../../types';
 
 export const SubtitleControls: React.FC = () => {
@@ -30,9 +33,24 @@ export const SubtitleControls: React.FC = () => {
   } = useApp();
 
   const [activeSubTab, setActiveSubTab] = useState<'style' | 'translate' | 'transcript'>('style');
-  const [targetLanguage, setTargetLanguage] = useState<string>('en');
+  const detectedLang = activeProject?.detectedLanguage || 'auto';
+  const [targetLanguage, setTargetLanguage] = useState<string>(() => {
+    if (subtitleStyle.isTranslated && subtitleStyle.subtitleLanguage && subtitleStyle.subtitleLanguage !== 'original') {
+      return subtitleStyle.subtitleLanguage;
+    }
+    return detectedLang === 'en' ? 'ml' : 'en';
+  });
   const [isTranslating, setIsTranslating] = useState(false);
+  const [translationError, setTranslationError] = useState<string | null>(null);
   const [isSavingTranscript, setIsSavingTranscript] = useState(false);
+
+  useEffect(() => {
+    if (subtitleStyle.isTranslated && subtitleStyle.subtitleLanguage && subtitleStyle.subtitleLanguage !== 'original') {
+      setTargetLanguage(subtitleStyle.subtitleLanguage);
+    } else if (detectedLang === 'en' && targetLanguage === 'en') {
+      setTargetLanguage('ml');
+    }
+  }, [activeHighlight?.id, subtitleStyle.isTranslated, subtitleStyle.subtitleLanguage, detectedLang]);
 
   // Filter project transcript segments covering the active highlight clip
   const clipSegments = (activeProject?.transcripts || []).filter((s) => {
@@ -133,22 +151,26 @@ export const SubtitleControls: React.FC = () => {
   };
 
   const handleTranslateSubtitles = async () => {
+    if (isTranslating) return;
     try {
       setIsTranslating(true);
+      setTranslationError(null);
       await translateCurrentClipSubtitles(targetLanguage);
-    } catch {
-      // handled in context
+    } catch (err: any) {
+      setTranslationError(err?.message || 'Subtitle translation failed. Please check your connection and retry.');
     } finally {
       setIsTranslating(false);
     }
   };
 
   const handleResetSubtitles = async () => {
+    if (isTranslating) return;
     try {
       setIsTranslating(true);
+      setTranslationError(null);
       await translateCurrentClipSubtitles('original');
-    } catch {
-      // handled in context
+    } catch (err: any) {
+      setTranslationError(err?.message || 'Failed to restore original subtitles.');
     } finally {
       setIsTranslating(false);
     }
@@ -172,8 +194,63 @@ export const SubtitleControls: React.FC = () => {
     }
   };
 
+  const subtitlesEnabled = subtitleStyle.enabled !== false;
+
+  const handleToggleSubtitlesVisibility = () => {
+    const nextEnabled = !subtitlesEnabled;
+    setSubtitleStyle((prev) => ({ ...prev, enabled: nextEnabled }));
+    if (activeProject && activeHighlight && !activeProject.isDemo) {
+      updateClipOnBackend(activeHighlight.id, {
+        subtitle_style: {
+          ...(activeHighlight.subtitleStyle || {}),
+          enabled: nextEnabled,
+        },
+      }).catch(() => {});
+    }
+    showToast(nextEnabled ? 'Subtitles enabled for preview & export' : 'Subtitles disabled for preview & export');
+  };
+
   return (
     <div className="space-y-6">
+      {/* Independent Subtitle Visibility Toggle (Preview & Export) */}
+      <div className="p-3.5 rounded-2xl bg-[#12141c] border border-[#212638] flex items-center justify-between gap-3">
+        <div>
+          <span className="text-xs font-bold text-white flex items-center gap-2">
+            <Type className="w-4 h-4 text-purple-400" />
+            <span>Show &amp; Burn Subtitles</span>
+            <span
+              className={`text-[10px] font-bold px-2 py-0.5 rounded-full border ${
+                subtitlesEnabled
+                  ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/30'
+                  : 'bg-slate-800 text-slate-400 border-slate-700'
+              }`}
+            >
+              {subtitlesEnabled ? 'ON' : 'OFF'}
+            </span>
+          </span>
+          <p className="text-[11px] text-slate-400 mt-0.5">
+            {subtitlesEnabled
+              ? 'Subtitles are visible in preview and burned into exported clips.'
+              : 'Subtitles are hidden in preview and excluded from export. Transcription & translations stay saved.'}
+          </p>
+        </div>
+        <button
+          type="button"
+          role="switch"
+          aria-checked={subtitlesEnabled}
+          onClick={handleToggleSubtitlesVisibility}
+          className={`relative inline-flex h-6 w-11 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors ${
+            subtitlesEnabled ? 'bg-purple-600' : 'bg-slate-700'
+          }`}
+        >
+          <span
+            className={`pointer-events-none inline-block h-5 w-5 transform rounded-full bg-white shadow transition ${
+              subtitlesEnabled ? 'translate-x-5' : 'translate-x-0'
+            }`}
+          />
+        </button>
+      </div>
+
       {/* Tab Switcher: Styling vs Multilingual Translation vs Manual Transcript */}
       <div className="flex items-center gap-1.5 p-1.5 rounded-2xl bg-[#12141c] border border-[#212638]">
         <button
@@ -499,14 +576,16 @@ export const SubtitleControls: React.FC = () => {
             )}
           </div>
 
-          {/* Current Spoken Language Info */}
-          <div className="p-3 rounded-xl bg-[#0b0c10] border border-[#23283b] flex items-center justify-between">
+          {/* Current Spoken Language vs Target Language */}
+          <div className="p-3 rounded-xl bg-[#0b0c10] border border-[#23283b] flex items-center justify-between gap-2">
             <div className="flex items-center gap-2">
               <Globe className="w-4 h-4 text-purple-400 shrink-0" />
               <div>
                 <span className="text-[11px] text-slate-400 block">Original Spoken Audio:</span>
                 <span className="text-xs font-bold text-white">
-                  {SUPPORTED_LANGUAGES[activeProject?.detectedLanguage || 'en'] || (activeProject?.detectedLanguage || 'Auto-Detected').toUpperCase()}
+                  {activeProject?.detectedLanguage
+                    ? SUPPORTED_LANGUAGES[activeProject.detectedLanguage] || activeProject.detectedLanguage.toUpperCase()
+                    : 'Auto-Detected'}
                 </span>
               </div>
             </div>
@@ -520,12 +599,16 @@ export const SubtitleControls: React.FC = () => {
           {/* Target Language Selection */}
           <div className="space-y-1.5">
             <label className="block text-xs font-semibold text-slate-300">
-              Select Subtitle Target Language
+              Target Subtitle Language
             </label>
             <select
               value={targetLanguage}
-              onChange={(e) => setTargetLanguage(e.target.value)}
-              className="w-full px-3 py-2.5 rounded-xl bg-[#0b0c10] border border-[#23283b] text-xs font-semibold text-white focus:outline-none focus:border-purple-500"
+              disabled={isTranslating}
+              onChange={(e) => {
+                setTargetLanguage(e.target.value);
+                setTranslationError(null);
+              }}
+              className="w-full px-3 py-2.5 rounded-xl bg-[#0b0c10] border border-[#23283b] text-xs font-semibold text-white focus:outline-none focus:border-purple-500 disabled:opacity-50"
             >
               {Object.entries(SUPPORTED_LANGUAGES).filter(([code]) => code !== 'auto').map(([code, name]) => (
                 <option key={code} value={code}>
@@ -535,22 +618,72 @@ export const SubtitleControls: React.FC = () => {
             </select>
           </div>
 
+          {/* Explicit Error Banner with Retry */}
+          {translationError && (
+            <div className="p-3 rounded-xl bg-red-950/40 border border-red-800/50 flex items-start justify-between gap-2 text-xs text-red-300">
+              <div className="flex items-start gap-2">
+                <AlertCircle className="w-4 h-4 text-red-400 shrink-0 mt-0.5" />
+                <span>{translationError}</span>
+              </div>
+              <button
+                type="button"
+                onClick={handleTranslateSubtitles}
+                disabled={isTranslating}
+                className="px-2.5 py-1 rounded-lg bg-red-900/60 hover:bg-red-800/70 text-red-100 text-[11px] font-semibold shrink-0 border border-red-700/50"
+              >
+                Retry
+              </button>
+            </div>
+          )}
+
+          {/* Completed / Partial Translation Status */}
+          {subtitleStyle.isTranslated && subtitleStyle.subtitleLanguage && subtitleStyle.subtitleLanguage !== 'original' && (
+            <div className="p-3 rounded-xl bg-emerald-950/25 border border-emerald-700/40 space-y-1.5 text-xs">
+              <div className="flex items-center justify-between gap-2">
+                <span className="font-semibold text-emerald-300 flex items-center gap-1.5">
+                  <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                  <span>
+                    Translated to {SUPPORTED_LANGUAGES[subtitleStyle.subtitleLanguage] || subtitleStyle.subtitleLanguage.toUpperCase()}
+                  </span>
+                </span>
+                {subtitleStyle.translationProvider && (
+                  <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-emerald-500/15 text-emerald-300 border border-emerald-500/30">
+                    {subtitleStyle.translationProvider === 'google_translate'
+                      ? 'Google Translate (Free)'
+                      : subtitleStyle.translationProvider === 'gemini'
+                      ? 'Gemini API'
+                      : subtitleStyle.translationProvider === 'openai'
+                      ? 'OpenAI API'
+                      : subtitleStyle.translationProvider}
+                  </span>
+                )}
+              </div>
+              {subtitleStyle.translationPartial && (
+                <p className="text-[11px] text-amber-300">
+                  Partial translation: some segments could not be translated and kept original text. Click Translate to retry.
+                </p>
+              )}
+            </div>
+          )}
+
           {/* Action Buttons */}
           <div className="flex items-center gap-2 pt-2">
             <button
               onClick={handleTranslateSubtitles}
-              disabled={isTranslating}
+              disabled={isTranslating || clipSegments.length === 0}
               className="flex-1 flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl bg-purple-600 hover:bg-purple-500 disabled:opacity-50 text-white text-xs font-bold shadow-md shadow-purple-600/30 transition-all"
             >
               {isTranslating ? (
                 <>
                   <Loader2 className="w-4 h-4 animate-spin" />
-                  <span>Translating...</span>
+                  <span>Translating to {SUPPORTED_LANGUAGES[targetLanguage] || targetLanguage}...</span>
                 </>
               ) : (
                 <>
                   <Languages className="w-4 h-4" />
-                  <span>Translate Subtitles</span>
+                  <span>
+                    {subtitleStyle.isTranslated ? 'Re-Translate Subtitles' : 'Translate Subtitles'}
+                  </span>
                 </>
               )}
             </button>
@@ -563,10 +696,50 @@ export const SubtitleControls: React.FC = () => {
                 title="Restore original spoken transcripts"
               >
                 <RotateCcw className="w-3.5 h-3.5" />
-                <span>Reset</span>
+                <span>Original</span>
               </button>
             )}
           </div>
+
+          {/* Translated vs Original Segment Comparison */}
+          {subtitleStyle.isTranslated && subtitleStyle.translatedSegments && subtitleStyle.translatedSegments.length > 0 && (
+            <div className="space-y-2 pt-1">
+              <div className="flex items-center justify-between text-[11px] text-slate-400">
+                <span className="font-semibold text-slate-300">
+                  Translated Subtitles ({subtitleStyle.translatedSegments.length} segments)
+                </span>
+                <span className="text-[10px] text-emerald-400">Original transcript preserved</span>
+              </div>
+              <div className="space-y-2 max-h-[220px] overflow-y-auto pr-1">
+                {subtitleStyle.translatedSegments.map((seg, idx) => (
+                  <div
+                    key={seg.segment_id || idx}
+                    className="p-2.5 rounded-xl bg-[#0b0c10] border border-[#23283b] space-y-1 text-xs"
+                  >
+                    <div className="flex items-center justify-between text-[10px] font-mono text-slate-500">
+                      <span>#{idx + 1}</span>
+                      <span>
+                        {seg.start.toFixed(1)}s → {seg.end.toFixed(1)}s
+                      </span>
+                    </div>
+                    {seg.original_text && (
+                      <p className="text-[11px] text-slate-400">
+                        <span className="text-[10px] uppercase tracking-wider text-slate-500 mr-1.5">Original:</span>
+                        {seg.original_text}
+                      </p>
+                    )}
+                    <p
+                      dir={/[\u0600-\u06FF]/.test(seg.text) ? 'rtl' : 'auto'}
+                      className="text-xs font-medium text-emerald-200"
+                    >
+                      <span className="text-[10px] uppercase tracking-wider text-emerald-400/80 mr-1.5">Translated:</span>
+                      {seg.text}
+                    </p>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
 
           {/* Font & Synchronization Notice */}
           <div className="p-3 rounded-xl bg-cyan-950/20 border border-cyan-800/30 space-y-1 text-slate-300 text-[11px]">

@@ -41,10 +41,13 @@ export const NewProjectModal: React.FC<NewProjectModalProps> = ({
   onClose,
   defaultTab = 'local',
 }) => {
-  const { createProjectFromLocal, createProjectFromUrl, backendStatus } = useApp();
+  const { createProjectFromLocal, createProjectFromUrl, backendStatus, settings } = useApp();
   const [tab, setTab] = useState<'local' | 'youtube' | 'twitch'>(defaultTab);
   const [url, setUrl] = useState('');
   const [sourceLanguage, setSourceLanguage] = useState<string>('auto');
+  const [transcriptionProfile, setTranscriptionProfile] = useState<'speed' | 'balanced' | 'accuracy'>(
+    settings.transcriptionProfile || 'balanced'
+  );
   const [isDragging, setIsDragging] = useState(false);
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
@@ -116,6 +119,7 @@ export const NewProjectModal: React.FC<NewProjectModalProps> = ({
           signal: ctrl.signal,
           onTelemetry: (t) => setTelemetry(t),
           language: sourceLanguage !== 'auto' ? sourceLanguage : undefined,
+          transcriptionProfile,
         }
       );
       onClose();
@@ -149,6 +153,7 @@ export const NewProjectModal: React.FC<NewProjectModalProps> = ({
       setError(null);
       await createProjectFromUrl(trimmed, tab === 'twitch' ? 'twitch' : 'youtube', {
         language: sourceLanguage !== 'auto' ? sourceLanguage : undefined,
+        transcriptionProfile,
       });
       onClose();
     } catch (err: any) {
@@ -377,7 +382,7 @@ export const NewProjectModal: React.FC<NewProjectModalProps> = ({
 
               <div className="flex items-center gap-2 text-[11px] text-slate-400">
                 <FileVideo className="w-4 h-4 text-slate-400" />
-                <span>Streams 8 MB verified slices directly to disk with automatic resume on interruption.</span>
+                <span>Streams 16 MB verified slices directly to disk with automatic resume on interruption.</span>
               </div>
             </div>
           ) : (
@@ -435,6 +440,41 @@ export const NewProjectModal: React.FC<NewProjectModalProps> = ({
                   {name}
                 </option>
               ))}
+            </select>
+          </div>
+          {sourceLanguage !== 'auto' &&
+            sourceLanguage !== 'en' &&
+            (settings.whisperModel === 'tiny' || settings.whisperModel === 'base') && (
+              <p className="text-[11px] text-amber-300/90 px-1">
+                Tip: Whisper &ldquo;{settings.whisperModel}&rdquo; often struggles with non-Latin scripts. Select{' '}
+                <strong>Small</strong> or <strong>Medium</strong> in Settings for accurate native subtitles.
+              </p>
+            )}
+
+          {/* Transcription Performance Profile */}
+          <div className="p-3.5 rounded-xl bg-[#0b0d14] border border-[#23283b] flex items-center justify-between gap-3">
+            <div>
+              <label htmlFor="tx-profile-select" className="text-xs font-semibold text-white block">
+                Transcription Profile
+              </label>
+              <span className="text-[11px] text-slate-400">
+                {transcriptionProfile === 'speed'
+                  ? 'Fastest batched decoding (minor accuracy trade-off)'
+                  : transcriptionProfile === 'accuracy'
+                  ? 'Higher beam search for maximum fidelity (slower)'
+                  : 'Balanced speed & multilingual accuracy'}
+              </span>
+            </div>
+            <select
+              id="tx-profile-select"
+              value={transcriptionProfile}
+              disabled={isSubmitting}
+              onChange={(e) => setTranscriptionProfile(e.target.value as 'speed' | 'balanced' | 'accuracy')}
+              className="bg-[#161a26] border border-[#2e364e] text-xs text-white rounded-lg px-3 py-1.5 focus:outline-none focus:border-purple-500 font-medium cursor-pointer"
+            >
+              <option value="speed">Speed</option>
+              <option value="balanced">Balanced (Recommended)</option>
+              <option value="accuracy">Accuracy</option>
             </select>
           </div>
         </div>

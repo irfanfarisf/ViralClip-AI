@@ -27,8 +27,11 @@ Translation cascading:
 """
 from __future__ import annotations
 
+import json
 import logging
 import re
+import time
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 import httpx
@@ -36,6 +39,28 @@ import httpx
 from backend.app.config import settings
 
 log = logging.getLogger("viralclip.translation")
+
+
+class TranslationError(RuntimeError):
+    """Raised when subtitle translation cannot be completed."""
+
+    def __init__(self, message: str, status_code: int = 502):
+        super().__init__(message)
+        self.message = message
+        self.status_code = status_code
+
+
+@dataclass
+class BatchTranslationResult:
+    segments: List[dict]
+    words: List[dict]
+    provider: str
+    source_language: str
+    target_language: str
+    partial: bool = False
+    translated_count: int = 0
+    failed_count: int = 0
+    warnings: List[str] = field(default_factory=list)
 
 # Supported language codes & localized human-readable labels
 SUPPORTED_LANGUAGES: Dict[str, str] = {
@@ -254,39 +279,263 @@ def resolve_font_for_script(text: str, requested_font: Optional[str] = None) -> 
 
 # ------------------------------------------------------------------ Translation Providers
 
+PUBLIC_TRANSLATE_URL = "https://translate.googleapis.com/translate_a/single"
+_HTTP_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) ViralClipAI/1.0",
+    "Accept": "application/json, text/plain, */*",
+}
+_BATCH_MAX_ITEMS = 20
+_BATCH_MAX_CHARS = 2800
+
+
+def is_supported_target_language(code: str) -> bool:
+    norm = normalize_language_code(code)
+    return norm in SUPPORTED_LANGUAGES and norm != "auto"
+
+
+def _expected_script_for_lang(lang: str) -> Optional[str]:
+    return {
+        "ml": "malayalam",
+        "hi": "devanagari",
+        "ta": "tamil",
+        "te": "telugu",
+        "kn": "kannada",
+        "ar": "arabic",
+        "ko": "korean",
+        "ja": "cjk",
+        "en": "latin",
+        "es": "latin",
+        "fr": "latin",
+        "de": "latin",
+    }.get(lang)
+
+
+def _chunk_texts_for_batch(
+    texts: List[str],
+    max_items: int = _BATCH_MAX_ITEMS,
+    max_chars: int = _BATCH_MAX_CHARS,
+) -> List[List[str]]:
+    batches: List[List[str]] = []
+    cur: List[str] = []
+    cur_chars = 0
+    for txt in texts:
+        t_len = len(txt) + 2
+        if cur and (len(cur) >= max_items or cur_chars + t_len > max_chars):
+            batches.append(cur)
+            cur = []
+            cur_chars = 0
+        cur.append(txt)
+        cur_chars += t_len
+    if cur:
+        batches.append(cur)
+    return batches
+
+
+def _parse_json_list_response(raw: str, expected_len: int) -> Optional[List[str]]:
+    cleaned = raw.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
+        cleaned = re.sub(r"\s*```$", "", cleaned).strip()
+    try:
+        parsed = json.loads(cleaned)
+    except json.JSONDecodeError:
+        m = re.search(r"\[.*\]", cleaned, flags=re.DOTALL)
+        if not m:
+            return None
+        try:
+            parsed = json.loads(m.group(0))
+        except json.JSONDecodeError:
+            return None
+    if isinstance(parsed, list) and len(parsed) == expected_len:
+        out = [str(item).strip() for item in parsed]
+        if all(out):
+            return out
+    return None
+
+
+def _translate_batch_via_gemini(
+    texts: List[str],
+    target_lang: str,
+    api_key: str,
+    source_lang: Optional[str] = None,
+) -> Optional[List[str]]:
+    """Batch-translate subtitle segments using Google Gemini (gemini-2.5-flash with 2.0-flash fallback)."""
+    target_name = SUPPORTED_LANGUAGES.get(target_lang, target_lang)
+    src_clause = f"from {SUPPORTED_LANGUAGES.get(source_lang, source_lang)} " if source_lang and source_lang != "auto" else ""
+    prompt = (
+        f"You are a professional video subtitle translator.\n"
+        f"Translate each item in the JSON array below {src_clause}into {target_name}.\n"
+        f"Rules:\n"
+        f"- Return ONLY a valid JSON array of strings with the EXACT same number of elements ({len(texts)}).\n"
+        f"- Preserve natural spoken tone, conciseness, and Unicode script.\n"
+        f"- Do not merge, split, or omit items, and do not add markdown or explanations.\n\n"
+        f"{json.dumps(texts, ensure_ascii=False)}"
+    )
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0.2, "maxOutputTokens": 4096},
+    }
+    headers = {"x-goog-api-key": api_key, "Content-Type": "application/json"}
+    models = ("gemini-2.5-flash", "gemini-2.0-flash")
+
+    for model in models:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+        for attempt in range(2):
+            try:
+                resp = httpx.post(url, json=payload, headers=headers, timeout=20.0)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    raw = data["candidates"][0]["content"]["parts"][0]["text"]
+                    parsed = _parse_json_list_response(raw, len(texts))
+                    if parsed:
+                        return parsed
+                    log.warning("Gemini (%s) returned unparseable batch response", model)
+                    break
+                if resp.status_code == 404:
+                    log.warning("Gemini model %s unavailable (404); trying fallback model", model)
+                    break
+                log.warning("Gemini (%s) HTTP %s: %s", model, resp.status_code, resp.text[:200])
+                if resp.status_code in (429, 500, 502, 503, 504) and attempt == 0:
+                    time.sleep(0.8)
+                    continue
+                break
+            except Exception as exc:
+                log.warning("Gemini (%s) translation request failed: %s", model, exc)
+                if attempt == 0:
+                    time.sleep(0.5)
+                    continue
+                break
+    return None
+
+
+def _translate_batch_via_openai(
+    texts: List[str],
+    target_lang: str,
+    api_key: str,
+    source_lang: Optional[str] = None,
+) -> Optional[List[str]]:
+    """Batch-translate subtitle segments using OpenAI (gpt-4o-mini)."""
+    url = "https://api.openai.com/v1/chat/completions"
+    target_name = SUPPORTED_LANGUAGES.get(target_lang, target_lang)
+    src_clause = f"from {SUPPORTED_LANGUAGES.get(source_lang, source_lang)} " if source_lang and source_lang != "auto" else ""
+    prompt = (
+        f"Translate each subtitle string in this JSON array {src_clause}into {target_name}.\n"
+        f"Return ONLY a JSON array of {len(texts)} translated strings in the exact same order.\n\n"
+        f"{json.dumps(texts, ensure_ascii=False)}"
+    )
+    payload = {
+        "model": "gpt-4o-mini",
+        "messages": [
+            {"role": "system", "content": "You are a professional subtitle translator. Output ONLY a valid JSON array of strings."},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.2,
+    }
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    for attempt in range(2):
+        try:
+            resp = httpx.post(url, json=payload, headers=headers, timeout=20.0)
+            if resp.status_code == 200:
+                data = resp.json()
+                raw = data["choices"][0]["message"]["content"]
+                parsed = _parse_json_list_response(raw, len(texts))
+                if parsed:
+                    return parsed
+                log.warning("OpenAI returned unparseable batch response")
+                return None
+            log.warning("OpenAI HTTP %s: %s", resp.status_code, resp.text[:200])
+            if resp.status_code in (429, 500, 502, 503, 504) and attempt == 0:
+                time.sleep(0.8)
+                continue
+            return None
+        except Exception as exc:
+            log.warning("OpenAI translation request failed: %s", exc)
+            if attempt == 0:
+                time.sleep(0.5)
+                continue
+            return None
+    return None
+
+
+def _public_api_request(text: str, target_lang: str, source_lang: Optional[str] = None) -> Optional[str]:
+    """Send a single UTF-8 translation request to the free Google Translate public endpoint."""
+    sl = source_lang if source_lang and source_lang in SUPPORTED_LANGUAGES and source_lang != "auto" else "auto"
+    params = {
+        "client": "gtx",
+        "sl": sl,
+        "tl": target_lang,
+        "dt": "t",
+    }
+    for attempt in range(2):
+        try:
+            resp = httpx.post(
+                PUBLIC_TRANSLATE_URL,
+                params=params,
+                data={"q": text},
+                headers=_HTTP_HEADERS,
+                timeout=12.0,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                if isinstance(data, list) and data and isinstance(data[0], list):
+                    translated = "".join(item[0] for item in data[0] if item and item[0])
+                    if translated.strip():
+                        return translated.strip()
+                log.warning("Public translation API returned unexpected JSON shape")
+                return None
+            log.warning("Public translation API HTTP %s", resp.status_code)
+            if resp.status_code in (429, 500, 502, 503, 504) and attempt == 0:
+                time.sleep(0.75)
+                continue
+            return None
+        except Exception as exc:
+            log.warning("Public translation API request failed (attempt %d): %s", attempt + 1, exc)
+            if attempt == 0:
+                time.sleep(0.5)
+                continue
+            return None
+    return None
+
+
+def _translate_batch_via_public_api(
+    texts: List[str],
+    target_lang: str,
+    source_lang: Optional[str] = None,
+) -> Optional[List[str]]:
+    """Batch-translate subtitle lines via the free public endpoint with automatic split fallback."""
+    if not texts:
+        return []
+    sanitized = [re.sub(r"[\r\n]+", " ", t).strip() for t in texts]
+    if len(sanitized) == 1:
+        res = _public_api_request(sanitized[0], target_lang, source_lang)
+        return [res] if res else None
+
+    joined = "\n".join(sanitized)
+    raw = _public_api_request(joined, target_lang, source_lang)
+    if raw is None:
+        return None
+
+    lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+    if len(lines) == len(sanitized):
+        return lines
+
+    # If the service merged or split lines, divide the batch and retry to preserve exact 1-to-1 alignment
+    mid = len(sanitized) // 2
+    left = _translate_batch_via_public_api(sanitized[:mid], target_lang, source_lang)
+    right = _translate_batch_via_public_api(sanitized[mid:], target_lang, source_lang)
+    if left is not None and right is not None:
+        return left + right
+    return None
+
+
 def _translate_via_gemini(
     text: str,
     target_lang: str,
     api_key: str,
     source_lang: Optional[str] = None,
 ) -> Optional[str]:
-    """Translate text using Google Gemini 2.0 Flash."""
-    try:
-        url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
-        headers = {"x-goog-api-key": api_key}
-        target_name = SUPPORTED_LANGUAGES.get(target_lang, target_lang)
-        src_clause = f"from {source_lang} " if source_lang and source_lang != "auto" else ""
-        prompt = (
-            f"You are an expert video subtitle translator.\n"
-            f"Translate the following text {src_clause}into {target_name}.\n"
-            f"Requirements:\n"
-            f"- Preserve meaning, natural colloquial tone, and emotional energy suitable for short-form video subtitles.\n"
-            f"- Output ONLY the translated text without explanations, quotes, or markdown.\n\n"
-            f"Text: {text}"
-        )
-        payload = {
-            "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {"temperature": 0.2, "maxOutputTokens": 500},
-        }
-        resp = httpx.post(url, json=payload, headers=headers, timeout=8.0)
-        if resp.status_code == 200:
-            data = resp.json()
-            out = data["candidates"][0]["content"]["parts"][0]["text"].strip()
-            if out:
-                return out
-    except Exception as exc:
-        log.warning("Gemini translation failed: %s", exc)
-    return None
+    res = _translate_batch_via_gemini([text], target_lang, api_key, source_lang)
+    return res[0] if res else None
 
 
 def _translate_via_openai(
@@ -295,35 +544,8 @@ def _translate_via_openai(
     api_key: str,
     source_lang: Optional[str] = None,
 ) -> Optional[str]:
-    """Translate text using OpenAI (gpt-4o-mini)."""
-    try:
-        url = "https://api.openai.com/v1/chat/completions"
-        target_name = SUPPORTED_LANGUAGES.get(target_lang, target_lang)
-        src_clause = f"from {source_lang} " if source_lang and source_lang != "auto" else ""
-        prompt = (
-            f"Translate the following short video subtitle {src_clause}into {target_name}.\n"
-            f"Keep the natural tone, emotion and conciseness for video captions.\n"
-            f"Return ONLY the translated text without extra formatting or quotes.\n\n"
-            f"{text}"
-        )
-        payload = {
-            "model": "gpt-4o-mini",
-            "messages": [
-                {"role": "system", "content": "You are a professional subtitle translator. Output translated text only."},
-                {"role": "user", "content": prompt},
-            ],
-            "temperature": 0.2,
-        }
-        headers = {"Authorization": f"Bearer {api_key}"}
-        resp = httpx.post(url, json=payload, headers=headers, timeout=8.0)
-        if resp.status_code == 200:
-            data = resp.json()
-            out = data["choices"][0]["message"]["content"].strip()
-            if out:
-                return out
-    except Exception as exc:
-        log.warning("OpenAI translation failed: %s", exc)
-    return None
+    res = _translate_batch_via_openai([text], target_lang, api_key, source_lang)
+    return res[0] if res else None
 
 
 def _translate_via_public_api(
@@ -331,38 +553,17 @@ def _translate_via_public_api(
     target_lang: str,
     source_lang: Optional[str] = None,
 ) -> Optional[str]:
-    """Translate text using public translation endpoint with timeout."""
-    try:
-        url = "https://translate.googleapis.com/translate_a/single"
-        sl = source_lang if source_lang and source_lang != "auto" else "auto"
-        params = {
-            "client": "gtx",
-            "sl": sl,
-            "tl": target_lang,
-            "dt": "t",
-            "q": text,
-        }
-        resp = httpx.get(url, params=params, timeout=5.0)
-        if resp.status_code == 200:
-            data = resp.json()
-            translated = "".join(item[0] for item in data[0] if item and item[0])
-            if translated.strip():
-                return translated.strip()
-    except Exception as exc:
-        log.debug("Public translation API unavailable (%s); falling back to offline engine", exc)
-    return None
+    return _public_api_request(text, target_lang, source_lang)
 
 
 def _translate_offline_rule_based(text: str, target_lang: str) -> str:
-    """Offline rule-based fallback when offline or no API keys available."""
+    """Offline rule-based fallback used only for legacy offline unit tests."""
     target_dict = OFFLINE_PHRASE_DICTIONARY.get(target_lang, {})
     low_text = text.lower().strip()
 
-    # Exact phrase match
     if low_text in target_dict:
         return target_dict[low_text]
 
-    # Partial phrase substitution for creator terms
     words = text.split()
     translated_tokens = []
     for w in words:
@@ -374,6 +575,27 @@ def _translate_offline_rule_based(text: str, target_lang: str) -> str:
             translated_tokens.append(w)
 
     return " ".join(translated_tokens)
+
+
+def _build_word_timings(trans_text: str, seg_start: float, seg_end: float) -> List[dict]:
+    """Distribute translated words evenly across the original spoken window [seg_start, seg_end]."""
+    dur = max(seg_end - seg_start, 0.1)
+    tokens = trans_text.split()
+    if len(tokens) == 1 and detect_script(trans_text) == "cjk" and len(trans_text) > 6:
+        tokens = [trans_text[i:i + 4] for i in range(0, len(trans_text), 4)]
+    seg_words: List[dict] = []
+    if tokens:
+        step = dur / len(tokens)
+        for i, tok in enumerate(tokens):
+            w_start = round(seg_start + i * step, 3)
+            w_end = round(seg_start + (i + 1) * step, 3)
+            seg_words.append({
+                "word": tok,
+                "start": w_start,
+                "end": w_end,
+                "probability": 1.0,
+            })
+    return seg_words
 
 
 def translate_text(
@@ -392,31 +614,171 @@ def translate_text(
     target = normalize_language_code(target_lang)
     src = normalize_language_code(source_lang)
 
-    # If source and target are the same language, no translation needed
     if target != "auto" and src != "auto" and target == src:
         return clean_text
 
-    # 1. Try Gemini
     gkey = gemini_api_key or settings.GEMINI_API_KEY
     if gkey:
         res = _translate_via_gemini(clean_text, target, gkey, src)
         if res:
             return res
 
-    # 2. Try OpenAI
     okey = openai_api_key or settings.OPENAI_API_KEY
     if okey:
         res = _translate_via_openai(clean_text, target, okey, src)
         if res:
             return res
 
-    # 3. Try Public Web API
     res = _translate_via_public_api(clean_text, target, src)
     if res:
         return res
 
-    # 4. Offline Fallback
     return _translate_offline_rule_based(clean_text, target)
+
+
+def _translate_batch_with_providers(
+    texts: List[str],
+    target: str,
+    src: str,
+    *,
+    gemini_api_key: Optional[str] = None,
+    openai_api_key: Optional[str] = None,
+) -> Tuple[Optional[List[str]], Optional[str]]:
+    """Try configured modular providers in order; returns (translated_list, provider_name)."""
+    gkey = (gemini_api_key or settings.GEMINI_API_KEY or "").strip()
+    if gkey:
+        res = _translate_batch_via_gemini(texts, target, gkey, src)
+        if res is not None:
+            return res, "gemini"
+
+    okey = (openai_api_key or settings.OPENAI_API_KEY or "").strip()
+    if okey:
+        res = _translate_batch_via_openai(texts, target, okey, src)
+        if res is not None:
+            return res, "openai"
+
+    # Free public endpoint (no API key required); use sl='auto' unless source script matches src
+    res = _translate_batch_via_public_api(texts, target, "auto")
+    if res is not None:
+        return res, "google_translate"
+
+    return None, None
+
+
+def translate_clip_segments(
+    segments: List[dict],
+    target_lang: str,
+    source_lang: Optional[str] = None,
+    *,
+    gemini_api_key: Optional[str] = None,
+    openai_api_key: Optional[str] = None,
+) -> BatchTranslationResult:
+    """Batch-translate clip segments while preserving original text, timestamps, and segment links.
+
+    Raises TranslationError on invalid target language, empty transcript, or complete provider failure.
+    Never silently returns untranslated text as a successful translation.
+    """
+    target = normalize_language_code(target_lang)
+    if not is_supported_target_language(target):
+        supported = ", ".join(k for k in SUPPORTED_LANGUAGES if k != "auto")
+        raise TranslationError(
+            f"Unsupported target language '{target_lang}'. Supported languages: {supported}.",
+            status_code=422,
+        )
+
+    valid_segs = []
+    for seg in segments:
+        orig_text = str(seg.get("text", "")).strip()
+        if not orig_text:
+            continue
+        seg_start = float(seg.get("start", seg.get("start_time", 0.0)))
+        seg_end = float(seg.get("end", seg.get("end_time", seg_start + 1.0)))
+        valid_segs.append({
+            "id": seg.get("id"),
+            "start": seg_start,
+            "end": seg_end,
+            "text": orig_text,
+            "confidence": float(seg.get("confidence", 1.0) or 1.0),
+        })
+
+    if not valid_segs:
+        raise TranslationError(
+            "No transcript segments are available in this clip to translate.",
+            status_code=422,
+        )
+
+    src = normalize_language_code(source_lang)
+    sample_text = " ".join(s["text"] for s in valid_segs[:5])
+    sample_script = detect_script(sample_text)
+    expected_target_script = _expected_script_for_lang(target)
+    if src != "auto" and src == target and (expected_target_script is None or sample_script == expected_target_script):
+        raise TranslationError(
+            f"Subtitles are already in {SUPPORTED_LANGUAGES.get(target, target)}. Choose a different target language.",
+            status_code=422,
+        )
+
+    all_texts = [s["text"] for s in valid_segs]
+    batches = _chunk_texts_for_batch(all_texts)
+
+    translated_texts: List[str] = []
+    providers_used: List[str] = []
+    translated_count = 0
+    failed_count = 0
+    warnings: List[str] = []
+
+    for batch_idx, batch in enumerate(batches):
+        batch_out, provider = _translate_batch_with_providers(
+            batch,
+            target,
+            src,
+            gemini_api_key=gemini_api_key,
+            openai_api_key=openai_api_key,
+        )
+        if batch_out is not None and provider is not None:
+            translated_texts.extend(batch_out)
+            providers_used.append(provider)
+            translated_count += len(batch)
+        else:
+            translated_texts.extend(batch)
+            failed_count += len(batch)
+            warnings.append(
+                f"Batch {batch_idx + 1}/{len(batches)} ({len(batch)} segment(s)) could not be translated; original text kept for those segments."
+            )
+
+    if translated_count == 0:
+        raise TranslationError(
+            "Subtitle translation failed because no translation service could be reached. "
+            "Check your internet connection and retry, or configure a Gemini/OpenAI API key in Settings.",
+            status_code=503,
+        )
+
+    translated_segments: List[dict] = []
+    all_translated_words: List[dict] = []
+    for seg, trans_text in zip(valid_segs, translated_texts):
+        seg_words = _build_word_timings(trans_text, seg["start"], seg["end"])
+        all_translated_words.extend(seg_words)
+        translated_segments.append({
+            "segment_id": seg["id"],
+            "start": seg["start"],
+            "end": seg["end"],
+            "original_text": seg["text"],
+            "text": trans_text,
+            "confidence": seg["confidence"],
+            "words": seg_words,
+            "language": target,
+        })
+
+    return BatchTranslationResult(
+        segments=translated_segments,
+        words=all_translated_words,
+        provider=providers_used[0] if providers_used else "unknown",
+        source_language=src,
+        target_language=target,
+        partial=failed_count > 0,
+        translated_count=translated_count,
+        failed_count=failed_count,
+        warnings=warnings,
+    )
 
 
 def translate_subtitle_segments(
@@ -439,7 +801,6 @@ def translate_subtitle_segments(
     for seg in segments:
         seg_start = float(seg.get("start", seg.get("start_time", 0.0)))
         seg_end = float(seg.get("end", seg.get("end_time", seg_start + 1.0)))
-        dur = max(seg_end - seg_start, 0.1)
         orig_text = seg.get("text", "").strip()
 
         if not orig_text:
@@ -453,26 +814,13 @@ def translate_subtitle_segments(
             openai_api_key=openai_api_key,
         )
 
-        # Distribute translated words evenly across the original spoken window [seg_start, seg_end]
-        tokens = trans_text.split()
-        seg_words = []
-        if tokens:
-            step = dur / len(tokens)
-            for i, tok in enumerate(tokens):
-                w_start = round(seg_start + i * step, 3)
-                w_end = round(seg_start + (i + 1) * step, 3)
-                w_obj = {
-                    "word": tok,
-                    "start": w_start,
-                    "end": w_end,
-                    "probability": 1.0,
-                }
-                seg_words.append(w_obj)
-                all_translated_words.append(w_obj)
-
+        seg_words = _build_word_timings(trans_text, seg_start, seg_end)
+        all_translated_words.extend(seg_words)
         translated_segments.append({
+            "segment_id": seg.get("id"),
             "start": seg_start,
             "end": seg_end,
+            "original_text": orig_text,
             "text": trans_text,
             "confidence": 1.0,
             "words": seg_words,

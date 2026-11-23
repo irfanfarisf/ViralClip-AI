@@ -37,6 +37,7 @@ async def lifespan(app: FastAPI):
     cleaner = asyncio.create_task(_cleanup_loop())
     yield
     cleaner.cancel()
+    await job_runner.shutdown_cleanup()
     await engine.dispose()
 
 

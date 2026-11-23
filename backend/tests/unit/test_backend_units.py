@@ -900,6 +900,532 @@ class TestMultilingualSupport(unittest.TestCase):
         self.assertLessEqual(abs(w_whole - w_split), max(5, int(w_whole * 0.25)))  # nothing lost at boundaries
         self.assertLessEqual(split[-1]["end"], 50.3)
 
+    def test_unsupported_language_and_silent_audio_and_auto_detect_lock(self):
+        import tempfile
+        import wave
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock, patch
+        from backend.app.transcription import TranscriptionError, transcribe_audio, validate_language
+
+        # 1. Unsupported language rejected cleanly
+        with self.assertRaises(TranscriptionError):
+            validate_language("klingon_xx")
+        self.assertIsNone(validate_language("auto"))
+        self.assertEqual(validate_language("ml-IN"), "ml")
+
+        # 2. Silent audio produces empty segments and does NOT falsely claim English
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
+            silent_wav = tf.name
+        try:
+            with wave.open(silent_wav, "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(16000)
+                wf.writeframes(b"\x00\x00" * (16000 * 3))
+            res = transcribe_audio(silent_wav, duration=3.0, language="auto", model_name="base", device="cpu")
+            self.assertEqual(list(res), [])
+            self.assertIsNone(res.language)
+        finally:
+            Path(silent_wav).unlink(missing_ok=True)
+
+        # 3. Non-silent audio with weak Window 0 English does not poison Window 1 Malayalam
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
+            tone_wav = tf.name
+        try:
+            with wave.open(tone_wav, "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(16000)
+                wf.writeframes(b"\x20\x00" * (16000 * 25))
+
+            fake_model = MagicMock()
+            win_calls = []
+
+            def _fake_transcribe(arr, **kwargs):
+                win_calls.append(kwargs)
+                idx = len(win_calls)
+                if idx == 1:
+                    # Brief 1.5s intro in English -> should NOT lock subsequent windows to "en"
+                    seg = SimpleNamespace(
+                        start=0.0,
+                        end=1.5,
+                        text="Hey",
+                        avg_logprob=-0.4,
+                        words=[SimpleNamespace(word="Hey", start=0.0, end=1.5, probability=0.9)],
+                    )
+                    return [seg], SimpleNamespace(language="en", language_probability=0.78)
+                # Window 2 is Malayalam speech
+                seg = SimpleNamespace(
+                    start=0.0,
+                    end=6.0,
+                    text="നമസ്കാരം സുഹൃത്തുക്കളെ",
+                    avg_logprob=-0.2,
+                    words=[
+                        SimpleNamespace(word="നമസ്കാരം", start=0.0, end=3.0, probability=0.95),
+                        SimpleNamespace(word="സുഹൃത്തുക്കളെ", start=3.1, end=6.0, probability=0.94),
+                    ],
+                )
+                return [seg], SimpleNamespace(language="ml", language_probability=0.96)
+
+            fake_model.transcribe.side_effect = _fake_transcribe
+            hw_info = {"label": "CPU (int8)", "gpu_accelerated": False}
+            with patch("backend.app.transcription.get_model_with_info", return_value=(fake_model, hw_info)):
+                res = transcribe_audio(tone_wav, duration=25.0, language="auto", window_seconds=12.0)
+
+            self.assertGreaterEqual(len(win_calls), 2)
+            self.assertEqual(win_calls[0]["task"], "transcribe")
+            self.assertIsNone(win_calls[1]["language"])  # Window 1 was NOT locked to "en"
+            self.assertEqual(res.language, "ml")
+            self.assertTrue(any("നമസ്കാരം" in s["text"] for s in res))
+        finally:
+            Path(tone_wav).unlink(missing_ok=True)
+
+    def test_mixed_script_font_resolution_and_rtl_and_non_overlapping_ass(self):
+        from unittest.mock import patch
+        from backend.app.subtitle_generator import SubtitleStyle, chunk_words, generate_ass
+        from backend.app.translation import translate_subtitle_segments
+
+        # 25 English words followed by Malayalam words (> 20 word boundary!)
+        words = [{"word": f"word{i}", "start": i * 0.3, "end": i * 0.3 + 0.25} for i in range(25)]
+        words.extend([
+            {"word": "നമസ്കാരം", "start": 7.5, "end": 8.0},
+            {"word": "സ്വാഗതം", "start": 8.0, "end": 8.5},
+        ])
+        ass = generate_ass(words, SubtitleStyle(uppercase=True))
+        self.assertIn("Nirmala UI", ass)
+        self.assertIn("നമസ്കാരം", ass)
+
+        # Arabic RTL 3-run libass ordering (post-active left, active middle, pre-active right)
+        ar_words = [
+            {"word": "مرحباً", "start": 0.0, "end": 0.8},
+            {"word": "بكم", "start": 0.7, "end": 1.4},
+            {"word": "رائع", "start": 1.3, "end": 2.0},
+        ]
+        ar_ass = generate_ass(ar_words, SubtitleStyle())
+        self.assertIn("Segoe UI", ar_ass)
+        dialogues = [l for l in ar_ass.splitlines() if l.startswith("Dialogue:")]
+        self.assertEqual(len(dialogues), 3)
+        # On word 0 active: "بكم رائع" precedes active "مرحباً" in ASS line so libass renders مرحباً on far right
+        self.assertLess(dialogues[0].index("بكم رائع"), dialogues[0].index("مرحباً"))
+        # On word 1 active: "رائع" left, active "بكم" middle, "مرحباً" right
+        self.assertLess(dialogues[1].index("رائع"), dialogues[1].index("بكم"))
+        self.assertLess(dialogues[1].index("بكم"), dialogues[1].index("مرحباً"))
+
+        # Sentence punctuation splits for Hindi/Arabic/Japanese
+        hi_words = [
+            {"word": "नमस्ते।", "start": 0.0, "end": 0.5},
+            {"word": "कैसे", "start": 0.6, "end": 1.0},
+            {"word": "हो?", "start": 1.1, "end": 1.5},
+        ]
+        chunks = chunk_words(hi_words, SubtitleStyle(max_words=4))
+        self.assertEqual(len(chunks), 2)
+
+        # Unspaced CJK translation produces multiple timed word tokens
+        with patch("backend.app.translation.translate_text", return_value="こんにちは世界ありがとうございます"):
+            _, ja_words = translate_subtitle_segments(
+                [{"start": 0.0, "end": 4.0, "text": "hello world thank you very much"}],
+                target_lang="ja",
+                source_lang="en",
+            )
+        self.assertGreater(len(ja_words), 1)
+
+    def test_clip_translation_batching_errors_and_sync(self):
+        from unittest.mock import patch
+        from backend.app.subtitle_generator import SubtitleStyle, collect_translated_words
+        from backend.app.translation import TranslationError, translate_clip_segments
+
+        # 1. Empty transcript raises 422
+        with self.assertRaises(TranslationError) as ctx_empty:
+            translate_clip_segments([], target_lang="ml", source_lang="en")
+        self.assertEqual(ctx_empty.exception.status_code, 422)
+
+        # 2. Unsupported language raises 422
+        with self.assertRaises(TranslationError) as ctx_lang:
+            translate_clip_segments([{"start": 0.0, "end": 2.0, "text": "hello"}], target_lang="xx", source_lang="en")
+        self.assertEqual(ctx_lang.exception.status_code, 422)
+
+        # 3. Complete provider failure raises 503 (never pretends original text is translated)
+        with patch("backend.app.translation._translate_batch_with_providers", return_value=(None, None)):
+            with self.assertRaises(TranslationError) as ctx_fail:
+                translate_clip_segments([{"start": 0.0, "end": 2.0, "text": "good morning everyone"}], target_lang="ml", source_lang="en")
+            self.assertEqual(ctx_fail.exception.status_code, 503)
+
+        # 4. Long video batching + partial translation reporting (25 segments -> 2 batches: 20 + 5)
+        long_segs = [{"id": f"s{i}", "start": i * 2.0, "end": i * 2.0 + 1.8, "text": f"line number {i}"} for i in range(25)]
+        call_count = {"n": 0}
+
+        def fake_provider(batch, target, src, **_kw):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                return [f"മലയാളം {i}" for i in range(len(batch))], "google_translate"
+            return None, None  # simulate network drop on second batch
+
+        with patch("backend.app.translation._translate_batch_with_providers", side_effect=fake_provider):
+            res = translate_clip_segments(long_segs, target_lang="ml", source_lang="en")
+        self.assertEqual(call_count["n"], 2)
+        self.assertTrue(res.partial)
+        self.assertEqual(res.translated_count, 20)
+        self.assertEqual(res.failed_count, 5)
+        self.assertEqual(len(res.segments), 25)
+        self.assertEqual(res.segments[0]["segment_id"], "s0")
+        self.assertEqual(res.segments[0]["original_text"], "line number 0")
+        self.assertIn("മലയാളം", res.segments[0]["text"])
+        self.assertTrue(len(res.warnings) > 0)
+
+        # 5. collect_translated_words shifts absolute timeline seconds properly even when start < dur (10s..40s)
+        abs_words = [
+            {"word": "നമസ്കാരം", "start": 12.0, "end": 14.0},
+            {"word": "സുഹൃത്തുക്കളെ", "start": 25.0, "end": 28.0},
+            {"word": "സ്വാഗതം", "start": 35.0, "end": 39.5},
+        ]
+        shifted = collect_translated_words(abs_words, start=10.0, end=40.0)
+        self.assertEqual(len(shifted), 3)
+        self.assertAlmostEqual(shifted[0]["start"], 2.0)
+        self.assertAlmostEqual(shifted[1]["start"], 15.0)
+        self.assertAlmostEqual(shifted[2]["start"], 25.0)
+
+        # 6. SubtitleStyle.from_dict preserves translated_words as list[dict] (not str)
+        st = SubtitleStyle.from_dict({"translated_words": abs_words, "subtitle_language": "ml"})
+        self.assertIsInstance(st.translated_words, list)
+        self.assertEqual(st.translated_words[0]["word"], "നമസ്കാരം")
+
+    def test_subtitle_visibility_off_skips_burn_in_and_preserves_data(self):
+        import shutil
+        import subprocess
+        import tempfile
+        from backend.app.export import render_clip
+        from backend.app.gpu_config import find_ffmpeg
+        from backend.app.subtitle_generator import SubtitleStyle
+
+        st_off = SubtitleStyle.from_dict({"enabled": False})
+        self.assertFalse(st_off.enabled)
+        st_on = SubtitleStyle.from_dict({"showSubtitles": True})
+        self.assertTrue(st_on.enabled)
+
+        ff = find_ffmpeg()
+        self.assertIsNotNone(ff)
+        tmp = Path(tempfile.mkdtemp(prefix="vc_sub_toggle_"))
+        try:
+            src = tmp / "src.mp4"
+            subprocess.run([
+                ff, "-y", "-loglevel", "error",
+                "-f", "lavfi", "-i", "color=c=0x101420:s=1280x720:r=30:d=4",
+                "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=4",
+                "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", str(src),
+            ], check=True)
+
+            segs = [{"start": 0.5, "end": 3.5, "text": "hello world test", "words": [
+                {"word": "hello", "start": 0.5, "end": 1.2},
+                {"word": "world", "start": 1.3, "end": 2.2},
+                {"word": "test", "start": 2.3, "end": 3.4},
+            ]}]
+            trans_words = [
+                {"word": "നമസ്കാരം", "start": 0.5, "end": 1.8},
+                {"word": "ലോകം", "start": 1.9, "end": 3.4},
+            ]
+
+            # 1. Export with subtitles ON (translated)
+            res_on = render_clip(
+                str(src), tmp / "out_on.mp4", 0.0, 3.5, has_audio=True,
+                layout="center_crop", segments=segs,
+                subtitle_style={"enabled": True, "subtitle_language": "ml", "translated_words": trans_words},
+                burn_subtitles=True,
+            )
+            self.assertTrue(res_on["sync_report"]["passed"])
+            self.assertEqual(res_on["subtitle_words"], 2)
+
+            # 2. Export with burn_subtitles=False (OFF) -> 0 burned words, same video/audio quality
+            res_off = render_clip(
+                str(src), tmp / "out_off.mp4", 0.0, 3.5, has_audio=True,
+                layout="center_crop", segments=segs,
+                subtitle_style={"enabled": False, "subtitle_language": "ml", "translated_words": trans_words},
+                burn_subtitles=False,
+            )
+            self.assertTrue(res_off["sync_report"]["passed"])
+            self.assertEqual(res_off["subtitle_words"], 0)
+            self.assertEqual(res_off["resolution"], "1080x1920")
+            self.assertEqual(res_off["audio_codec"], "aac")
+
+            # 3. Even if burn_subtitles=True, subtitle_style.enabled=False prevents silent burn-in
+            res_style_off = render_clip(
+                str(src), tmp / "out_style_off.mp4", 0.0, 3.5, has_audio=True,
+                layout="center_crop", segments=segs,
+                subtitle_style={"enabled": False, "translated_words": trans_words},
+                burn_subtitles=True,
+            )
+            self.assertTrue(res_style_off["sync_report"]["passed"])
+            self.assertEqual(res_style_off["subtitle_words"], 0)
+
+            # 4. Video with no audio and no transcription exports cleanly with subtitles OFF
+            res_silent = render_clip(
+                str(src), tmp / "out_silent_off.mp4", 0.0, 3.5, has_audio=False,
+                layout="center_crop", segments=[], subtitle_style={"enabled": False},
+                burn_subtitles=False,
+            )
+            self.assertTrue(res_silent["sync_report"]["passed"])
+            self.assertEqual(res_silent["subtitle_words"], 0)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+class TestClipEditorAudioPreservation(unittest.TestCase):
+    def test_trimmed_export_preserves_audio_and_sync(self):
+        import subprocess
+        import tempfile
+        from backend.app.export import render_clip
+        from backend.app.gpu_config import find_ffmpeg
+
+        ffmpeg = find_ffmpeg()
+        self.assertIsNotNone(ffmpeg, "FFmpeg is required for this test")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "source_with_audio.mp4"
+            out = Path(tmp) / "clip_with_audio.mp4"
+            # Generate 6s 1280x720 video with 440Hz stereo audio
+            subprocess.run(
+                [
+                    ffmpeg, "-y",
+                    "-f", "lavfi", "-i", "testsrc2=size=1280x720:rate=30:duration=6",
+                    "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=6",
+                    "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+                    "-c:a", "aac", "-b:a", "128k",
+                    str(src),
+                ],
+                check=True,
+                capture_output=True,
+            )
+
+            res = render_clip(
+                src_path=str(src),
+                out_path=out,
+                start=1.5,
+                end=4.5,
+                has_audio=True,
+                layout="center_crop",
+                subtitle_style={"enabled": False},
+                segments=[],
+            )
+            self.assertTrue(out.exists())
+            val = res["sync_report"]
+            self.assertTrue(val["passed"], f"Validation failed: {val}")
+            self.assertEqual(val["audio_codec"], "aac")
+            self.assertAlmostEqual(val["video_duration"], 3.0, delta=0.35)
+            self.assertLessEqual(abs(val["sync_offset_ms"]), 80)
+
+    def test_silent_video_exports_cleanly_without_audio(self):
+        import subprocess
+        import tempfile
+        from backend.app.export import render_clip
+        from backend.app.gpu_config import find_ffmpeg
+
+        ffmpeg = find_ffmpeg()
+        self.assertIsNotNone(ffmpeg, "FFmpeg is required for this test")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "source_silent.mp4"
+            out = Path(tmp) / "clip_silent.mp4"
+            subprocess.run(
+                [
+                    ffmpeg, "-y",
+                    "-f", "lavfi", "-i", "testsrc2=size=1280x720:rate=30:duration=4",
+                    "-an",
+                    "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+                    str(src),
+                ],
+                check=True,
+                capture_output=True,
+            )
+
+            res = render_clip(
+                src_path=str(src),
+                out_path=out,
+                start=0.5,
+                end=3.0,
+                has_audio=False,
+                layout="center_crop",
+                subtitle_style={"enabled": False},
+                segments=[],
+            )
+            self.assertTrue(out.exists())
+            val = res["sync_report"]
+            self.assertTrue(val["passed"], f"Validation failed: {val}")
+            self.assertIsNone(val["audio_codec"])
+
+    def test_multi_audio_stream_prefers_default_and_maps_stream_index(self):
+        import json
+        import tempfile
+        from unittest.mock import MagicMock, patch
+        from backend.app.gpu_config import CPU_ENCODER
+        from backend.app.video_import import probe_video
+        from backend.app.video_processor import build_render_command
+
+        fake_probe = {
+            "format": {"duration": "12.0"},
+            "streams": [
+                {"codec_type": "video", "codec_name": "h264", "width": 1920, "height": 1080, "r_frame_rate": "30/1"},
+                {"codec_type": "audio", "codec_name": "aac", "sample_rate": "44100", "channels": 2, "disposition": {"default": 0}},
+                {"codec_type": "audio", "codec_name": "opus", "sample_rate": "48000", "channels": 2, "disposition": {"default": 1}},
+            ],
+        }
+        mock_proc = MagicMock(returncode=0, stdout=json.dumps(fake_probe), stderr="")
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_path = Path(tmp) / "multi_audio.mp4"
+            fake_path.write_bytes(b"0000")
+            with patch("backend.app.video_import.subprocess.run", return_value=mock_proc):
+                meta = probe_video(fake_path)
+        self.assertTrue(meta.has_audio)
+        self.assertEqual(meta.audio_codec, "opus")
+
+        cmd = build_render_command(
+            ffmpeg="ffmpeg",
+            src="in.mp4",
+            out="out.mp4",
+            start=2.0,
+            duration=5.0,
+            filter_graph="[0:v]scale=1080:1920[vout]",
+            encoder=CPU_ENCODER,
+            has_audio=True,
+            audio_stream_index=1,
+        )
+        self.assertIn("0:a:1", cmd)
+
+
+class TestPerformanceOptimizations(unittest.TestCase):
+    def test_url_normalization_and_final_file_selection(self):
+        import tempfile
+        import shutil
+        from backend.app.video_import import _select_downloaded_file, normalize_url
+
+        self.assertEqual(normalize_url("https://www.youtube.com/watch?v=dQw4w9WgXcQ&t=42s"), "youtube:dQw4w9WgXcQ")
+        self.assertEqual(normalize_url("https://youtu.be/dQw4w9WgXcQ?si=xyz"), "youtube:dQw4w9WgXcQ")
+        self.assertEqual(normalize_url("https://m.youtube.com/shorts/dQw4w9WgXcQ"), "youtube:dQw4w9WgXcQ")
+        self.assertEqual(normalize_url("https://www.twitch.tv/videos/123456789?t=1h2m"), "twitch:video:123456789")
+
+        tmp = Path(tempfile.mkdtemp(prefix="vc_sel_"))
+        try:
+            (tmp / "source.f137.mp4").write_bytes(b"0" * 500)
+            (tmp / "source.mp4.part").write_bytes(b"0" * 900)
+            merged = tmp / "source.mp4"
+            merged.write_bytes(b"0" * 300)
+            chosen = _select_downloaded_file(tmp)
+            self.assertEqual(chosen, merged)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_import_external_single_pass_monotonic_and_cancel_cleanup(self):
+        import shutil
+        import tempfile
+        from unittest.mock import patch
+        from backend.app.video_import import ImportFailure, VideoMetadata, import_external
+
+        tmp = Path(tempfile.mkdtemp(prefix="vc_ytdl_"))
+        try:
+            events = []
+            extract_calls = []
+
+            class FakeYDL:
+                def __init__(self, opts):
+                    self.opts = opts
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *args):
+                    return False
+
+                def extract_info(self, url, download=False, process=True):
+                    extract_calls.append((url, download))
+                    return {
+                        "title": "Demo Stream",
+                        "duration": 120.0,
+                        "requested_formats": [
+                            {"filesize": 1000},
+                            {"filesize": 500},
+                        ],
+                    }
+
+                def process_ie_result(self, info, download=True):
+                    hook = self.opts["progress_hooks"][0]
+                    pp_hook = self.opts["postprocessor_hooks"][0]
+                    hook({"status": "downloading", "filename": "f1.mp4", "downloaded_bytes": 500, "total_bytes": 1000, "speed": 2000.0, "eta": 1.0})
+                    hook({"status": "downloading", "filename": "f1.mp4", "downloaded_bytes": 1000, "total_bytes": 1000, "speed": 2000.0, "eta": 0.0})
+                    hook({"status": "finished", "filename": "f1.mp4", "downloaded_bytes": 1000, "total_bytes": 1000})
+                    hook({"status": "downloading", "filename": "f2.m4a", "downloaded_bytes": 250, "total_bytes": 500, "speed": 1000.0, "eta": 1.0})
+                    hook({"status": "finished", "filename": "f2.m4a", "downloaded_bytes": 500, "total_bytes": 500})
+                    pp_hook({"status": "started"})
+                    out_file = tmp / "source.mp4"
+                    out_file.write_bytes(b"mp4data")
+                    return {"requested_downloads": [{"filepath": str(out_file)}]}
+
+                def download(self, _urls):
+                    raise AssertionError("Should use single-pass process_ie_result, not double extract via download()")
+
+            fake_mod = type("FakeYtDlpMod", (), {"YoutubeDL": FakeYDL})
+            fake_meta = VideoMetadata(duration=120.0, width=1920, height=1080, fps=30.0, codec="h264", audio_codec="aac", has_audio=True, is_vfr=False, file_size_mb=1.0, file_size_bytes=1048576)
+            with patch.dict("sys.modules", {"yt_dlp": fake_mod}):
+                with patch("backend.app.video_import.probe_video", return_value=fake_meta):
+                    path, meta, plat, title = import_external(
+                        "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+                        tmp,
+                        progress_cb=lambda p: events.append((p.stage, p.progress)),
+                    )
+            self.assertEqual(len(extract_calls), 1)
+            self.assertEqual(path.name, "source.mp4")
+            self.assertEqual(plat, "youtube")
+            pcts = [p for _, p in events]
+            self.assertEqual(pcts, sorted(pcts))
+
+            # Cancellation cleans up .part files
+            (tmp / "source.mp4.part").write_bytes(b"partial")
+            with patch.dict("sys.modules", {"yt_dlp": fake_mod}):
+                with self.assertRaises(ImportFailure) as ctx:
+                    import_external(
+                        "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+                        tmp,
+                        should_cancel=lambda: True,
+                        keep_partial_on_error=True,
+                    )
+            self.assertEqual(ctx.exception.status, 499)
+            self.assertFalse((tmp / "source.mp4.part").exists())
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_whisper_profiles_hardware_truthfulness_and_vectorized_energy(self):
+        import tempfile
+        import wave
+        import numpy as np
+        from backend.app import transcription
+
+        hw = transcription.detect_whisper_hardware()
+        self.assertEqual(hw["device"], "cpu")
+        self.assertFalse(hw["gpu_accelerated"])
+        self.assertGreaterEqual(hw["cpu_threads"], 2)
+        self.assertLessEqual(hw["cpu_threads"], 6)
+        self.assertIn("backend_note", hw)
+
+        self.assertEqual(transcription.normalize_profile("SPEED"), "speed")
+        self.assertEqual(transcription.normalize_profile("ACCURACY"), "accuracy")
+        self.assertEqual(transcription.normalize_profile("unknown"), "balanced")
+
+        # Verify vectorized compute_energy produces expected RMS values on 2s 16 kHz WAV
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
+            wav_p = Path(tf.name)
+        try:
+            t = np.linspace(0, 2.0, 32000, endpoint=False)
+            sig = (0.5 * np.sin(2 * np.pi * 440 * t) * 32767).astype(np.int16)
+            with wave.open(str(wav_p), "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(16000)
+                wf.writeframes(sig.tobytes())
+            energy = transcription.compute_energy(str(wav_p), window=0.5)
+            self.assertEqual(len(energy), 4)
+            # RMS of 0.5*sin is ~0.3535
+            for v in energy:
+                self.assertAlmostEqual(v, 0.3535, delta=0.01)
+        finally:
+            wav_p.unlink(missing_ok=True)
+
 
 if __name__ == "__main__":
     unittest.main()

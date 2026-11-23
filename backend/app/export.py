@@ -165,15 +165,22 @@ def render_clip(
     try:
         ass_name = None
         words: List[dict] = []
-        if burn_subtitles:
-            st_dict = dict(subtitle_style or {})
-            if st_dict.get("translated_words"):
-                words = collect_translated_words(st_dict["translated_words"], start, end)
+        st_dict = dict(subtitle_style or {})
+        style_enabled_raw = st_dict.get("enabled", True)
+        style_enabled = (
+            style_enabled_raw
+            if isinstance(style_enabled_raw, bool)
+            else str(style_enabled_raw).strip().lower() not in ("false", "0", "no", "off")
+        )
+        if burn_subtitles and style_enabled:
+            trans_words = st_dict.get("translated_words") or st_dict.get("translatedWords")
+            if trans_words:
+                words = collect_translated_words(trans_words, start, end)
             if not words and segments:
                 words = collect_words(segments, start, end)
             if words:
                 (work / "subs.ass").write_text(
-                    generate_ass(words, SubtitleStyle.from_dict(st_dict)), encoding="utf-8")
+                    generate_ass(words, SubtitleStyle.from_dict(st_dict)), encoding="utf-8-sig")
                 ass_name = "subs.ass"
 
         comp = vp.analyze_video_composition(src_path, start, end)

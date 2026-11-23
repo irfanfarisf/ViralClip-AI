@@ -45,15 +45,25 @@ interface AppContextType {
     ffprobe: boolean;
     gpuEncoder: string | null;
     whisper: boolean;
+    whisperHardware?: {
+      device?: string;
+      compute_type?: string;
+      cpu_threads?: number;
+      gpu_accelerated?: boolean;
+      cpu_name?: string;
+      amd_gpu?: string | null;
+      backend_note?: string;
+      label?: string;
+    } | null;
     pythonVersion: string;
   };
   refreshBackendStatus: () => Promise<void>;
   createProjectFromLocal: (
     file: File,
     onUploadProgress?: (p: number) => void,
-    options?: { signal?: AbortSignal; onTelemetry?: (t: ImportTelemetry) => void; language?: string }
+    options?: { signal?: AbortSignal; onTelemetry?: (t: ImportTelemetry) => void; language?: string; transcriptionProfile?: string }
   ) => Promise<VideoProject>;
-  createProjectFromUrl: (url: string, platform: 'youtube' | 'twitch', options?: { language?: string }) => Promise<VideoProject>;
+  createProjectFromUrl: (url: string, platform: 'youtube' | 'twitch', options?: { language?: string; transcriptionProfile?: string }) => Promise<VideoProject>;
   deleteProject: (id: string) => Promise<void>;
   toggleHighlightSelection: (projectId: string, highlightId: string) => void;
   exportCurrentHighlight: (clipTitle?: string) => Promise<ExportedClip>;
@@ -70,6 +80,7 @@ interface AppContextType {
 }
 
 const defaultSubtitleStyle: SubtitleStyle = {
+  enabled: true,
   preset: 'yellow_highlight',
   fontSize: 'lg',
   fontFamily: 'Montserrat',
@@ -106,6 +117,7 @@ const defaultSettings: AppSettings = {
   geminiApiKey: '', // NOT saved to localStorage
   openaiApiKey: '', // NOT saved to localStorage
   whisperModel: 'base',
+  transcriptionProfile: 'balanced',
   device: 'cpu',
   defaultLayout: 'facecam_gameplay',
   defaultSubtitlePreset: 'beast_yellow',
@@ -136,7 +148,14 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     const saved = localStorage.getItem('viralclip_subtitle_style');
     if (saved) {
       try {
-        return JSON.parse(saved);
+        const parsed = JSON.parse(saved);
+        return {
+          ...defaultSubtitleStyle,
+          ...parsed,
+          translatedWords: undefined,
+          isTranslated: false,
+          subtitleLanguage: undefined,
+        };
       } catch {
         return defaultSubtitleStyle;
       }
@@ -174,12 +193,30 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     return defaultSettings;
   });
 
-  const [backendStatus, setBackendStatus] = useState({
+  const [backendStatus, setBackendStatus] = useState<{
+    online: boolean;
+    ffmpeg: boolean;
+    ffprobe: boolean;
+    gpuEncoder: string | null;
+    whisper: boolean;
+    whisperHardware?: {
+      device?: string;
+      compute_type?: string;
+      cpu_threads?: number;
+      gpu_accelerated?: boolean;
+      cpu_name?: string;
+      amd_gpu?: string | null;
+      backend_note?: string;
+      label?: string;
+    } | null;
+    pythonVersion: string;
+  }>({
     online: false,
     ffmpeg: false,
     ffprobe: false,
-    gpuEncoder: null as string | null,
+    gpuEncoder: null,
     whisper: false,
+    whisperHardware: null,
     pythonVersion: 'Unknown',
   });
 
@@ -217,6 +254,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           currentStage: j.current_stage || 'Processing',
           errorMessage: j.error_message || undefined,
           activeJobId: j.id,
+          elapsedSeconds: j.elapsed_seconds,
+          whisperProfile: j.whisper_profile,
           detectedLanguage: j.detected_language,
           detectedLanguageProbability: j.detected_language_probability,
           transcripts: [],
@@ -245,7 +284,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         for (const j of backendJobs) {
           if (j.id) {
             syncJobDetails(j.id);
-            if (['queued', 'analyzing', 'transcribing', 'detecting'].includes(j.status) && !activeWsRef.current) {
+            if (
+              ['queued', 'initializing', 'downloading', 'uploading', 'validating', 'extracting_metadata', 'analyzing', 'transcribing', 'detecting'].includes(
+                String(j.status || '').toLowerCase()
+              ) &&
+              !activeWsRef.current
+            ) {
               activeWsRef.current = connectJobWebSocket(j.id, (data) => {
                 setProjects((prev) =>
                   prev.map((p) =>
@@ -255,6 +299,18 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
                           progress: data.progress,
                           currentStage: data.stage,
                           status: data.status as any,
+                          importState: data.import_state || data.status,
+                          bytesTransferred: data.bytes_transferred ?? p.bytesTransferred,
+                          totalBytes: data.total_bytes ?? p.totalBytes,
+                          speedBps: data.speed_bps ?? p.speedBps,
+                          etaSeconds: data.eta_seconds ?? p.etaSeconds,
+                          elapsedSeconds: data.elapsed_seconds ?? p.elapsedSeconds,
+                          transcribedSeconds: data.transcribed_seconds ?? p.transcribedSeconds,
+                          totalAudioSeconds: data.total_audio_seconds ?? p.totalAudioSeconds,
+                          whisperModel: data.whisper_model ?? p.whisperModel,
+                          whisperProfile: data.whisper_profile ?? p.whisperProfile,
+                          whisperDevice: data.whisper_device ?? p.whisperDevice,
+                          realtimeFactor: data.realtime_factor ?? p.realtimeFactor,
                           detectedLanguage: data.detected_language ?? p.detectedLanguage,
                           detectedLanguageProbability: data.detected_language_probability ?? p.detectedLanguageProbability,
                         }
@@ -268,12 +324,25 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
                         progress: data.progress,
                         currentStage: data.stage,
                         status: data.status as any,
+                        importState: data.import_state || data.status,
+                        bytesTransferred: data.bytes_transferred ?? prev.bytesTransferred,
+                        totalBytes: data.total_bytes ?? prev.totalBytes,
+                        speedBps: data.speed_bps ?? prev.speedBps,
+                        etaSeconds: data.eta_seconds ?? prev.etaSeconds,
+                        elapsedSeconds: data.elapsed_seconds ?? prev.elapsedSeconds,
+                        transcribedSeconds: data.transcribed_seconds ?? prev.transcribedSeconds,
+                        totalAudioSeconds: data.total_audio_seconds ?? prev.totalAudioSeconds,
+                        whisperModel: data.whisper_model ?? prev.whisperModel,
+                        whisperProfile: data.whisper_profile ?? prev.whisperProfile,
+                        whisperDevice: data.whisper_device ?? prev.whisperDevice,
+                        realtimeFactor: data.realtime_factor ?? prev.realtimeFactor,
                         detectedLanguage: data.detected_language ?? prev.detectedLanguage,
                         detectedLanguageProbability: data.detected_language_probability ?? prev.detectedLanguageProbability,
                       }
                     : prev
                 );
-                if (data.progress >= 100 || data.status === 'ready') {
+                const lowSt = String(data.status || '').toLowerCase();
+                if (data.progress >= 100 || ['ready', 'completed', 'failed', 'cancelled'].includes(lowSt)) {
                   syncJobDetails(j.id, true);
                 }
               });
@@ -312,7 +381,17 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   }, [settings]);
 
   useEffect(() => {
-    localStorage.setItem('viralclip_subtitle_style', JSON.stringify(subtitleStyle));
+    const {
+      translatedWords,
+      translatedSegments,
+      isTranslated,
+      subtitleLanguage,
+      translationProvider,
+      translationPartial,
+      translationWarnings,
+      ...safeStyle
+    } = subtitleStyle;
+    localStorage.setItem('viralclip_subtitle_style', JSON.stringify(safeStyle));
   }, [subtitleStyle]);
 
   useEffect(() => {
@@ -364,6 +443,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         suggestedDescription: c.suggested_description || c.description,
         thumbnailText: c.thumbnail_text || '',
         thumbnailTimestamp: c.thumbnail_timestamp,
+        subtitleStyle: c.subtitle_style || undefined,
       }));
 
       const exported: ExportedClip[] = (details.clips || [])
@@ -403,6 +483,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
             height: details.video?.height || p.height,
             fps: details.video?.fps || p.fps,
             fileSizeMb: details.video?.file_size_mb ?? p.fileSizeMb,
+            hasAudio: details.video?.has_audio !== undefined ? Boolean(details.video.has_audio) : p.hasAudio,
             status: details.status,
             importState: details.import_state || details.status,
             progress: details.progress,
@@ -416,8 +497,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
             transcribedSeconds: details.transcribed_seconds,
             totalAudioSeconds: details.total_audio_seconds,
             whisperModel: details.whisper_model,
+            whisperProfile: details.whisper_profile,
             whisperDevice: details.whisper_device,
             realtimeFactor: details.realtime_factor,
+            elapsedSeconds: details.elapsed_seconds,
             detectedLanguage: details.detected_language || p.detectedLanguage,
             detectedLanguageProbability: details.detected_language_probability ?? p.detectedLanguageProbability,
             transcripts: details.transcripts || [],
@@ -439,6 +522,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           height: details.video?.height || prev.height,
           fps: details.video?.fps || prev.fps,
           fileSizeMb: details.video?.file_size_mb ?? prev.fileSizeMb,
+          hasAudio: details.video?.has_audio !== undefined ? Boolean(details.video.has_audio) : prev.hasAudio,
           status: details.status,
           importState: details.import_state || details.status,
           progress: details.progress,
@@ -449,6 +533,13 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           speedBps: details.speed_bps,
           etaSeconds: details.eta_seconds,
           canResume: details.can_resume,
+          transcribedSeconds: details.transcribed_seconds,
+          totalAudioSeconds: details.total_audio_seconds,
+          whisperModel: details.whisper_model,
+          whisperProfile: details.whisper_profile,
+          whisperDevice: details.whisper_device,
+          realtimeFactor: details.realtime_factor,
+          elapsedSeconds: details.elapsed_seconds,
           detectedLanguage: details.detected_language || prev.detectedLanguage,
           detectedLanguageProbability: details.detected_language_probability ?? prev.detectedLanguageProbability,
           transcripts: details.transcripts || [],
@@ -469,7 +560,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const createProjectFromLocal = async (
     file: File,
     onUploadProgress?: (p: number) => void,
-    options?: { signal?: AbortSignal; onTelemetry?: (t: ImportTelemetry) => void; language?: string }
+    options?: { signal?: AbortSignal; onTelemetry?: (t: ImportTelemetry) => void; language?: string; transcriptionProfile?: string }
   ): Promise<VideoProject> => {
     // 1. Create client-side object URL for immediate local preview
     const localVideoUrl = URL.createObjectURL(file);
@@ -479,6 +570,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     const res = await uploadVideoFile(file, onUploadProgress, {
       language: options?.language,
       whisperModel: settings.whisperModel,
+      transcriptionProfile: options?.transcriptionProfile || settings.transcriptionProfile,
       geminiApiKey: settings.geminiApiKey,
       openaiApiKey: settings.openaiApiKey,
       signal: options?.signal,
@@ -495,11 +587,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       height: res.height,
       fps: res.fps,
       fileSizeMb: res.fileSizeMb,
-      status: 'analyzing',
-      progress: 10,
-      currentStage: 'Ingesting video on backend...',
+      status: 'QUEUED',
+      progress: 0,
+      currentStage: 'Queued for background analysis...',
       activeJobId: res.jobId,
       sourceLanguage: options?.language,
+      whisperProfile: options?.transcriptionProfile || settings.transcriptionProfile,
       transcripts: [],
       highlights: [],
       selectedClipIds: [],
@@ -534,10 +627,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
               totalBytes: data.total_bytes ?? p.totalBytes,
               speedBps: data.speed_bps ?? p.speedBps,
               etaSeconds: data.eta_seconds ?? p.etaSeconds,
+              elapsedSeconds: data.elapsed_seconds ?? p.elapsedSeconds,
               canResume: data.can_resume ?? p.canResume,
               transcribedSeconds: data.transcribed_seconds ?? p.transcribedSeconds,
               totalAudioSeconds: data.total_audio_seconds ?? p.totalAudioSeconds,
               whisperModel: data.whisper_model ?? p.whisperModel,
+              whisperProfile: data.whisper_profile ?? p.whisperProfile,
               whisperDevice: data.whisper_device ?? p.whisperDevice,
               realtimeFactor: data.realtime_factor ?? p.realtimeFactor,
             };
@@ -556,16 +651,19 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
             totalBytes: data.total_bytes ?? prev.totalBytes,
             speedBps: data.speed_bps ?? prev.speedBps,
             etaSeconds: data.eta_seconds ?? prev.etaSeconds,
+            elapsedSeconds: data.elapsed_seconds ?? prev.elapsedSeconds,
             canResume: data.can_resume ?? prev.canResume,
             transcribedSeconds: data.transcribed_seconds ?? prev.transcribedSeconds,
             totalAudioSeconds: data.total_audio_seconds ?? prev.totalAudioSeconds,
             whisperModel: data.whisper_model ?? prev.whisperModel,
+            whisperProfile: data.whisper_profile ?? prev.whisperProfile,
             whisperDevice: data.whisper_device ?? prev.whisperDevice,
             realtimeFactor: data.realtime_factor ?? prev.realtimeFactor,
           };
         });
 
-        if (data.progress >= 100 || data.status === 'ready' || data.status === 'COMPLETED') {
+        const lowSt = String(data.status || '').toLowerCase();
+        if (data.progress >= 100 || ['ready', 'completed', 'failed', 'cancelled'].includes(lowSt)) {
           syncJobDetails(res.jobId);
         }
       },
@@ -586,11 +684,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const createProjectFromUrl = async (
     url: string,
     platform: 'youtube' | 'twitch',
-    options?: { language?: string }
+    options?: { language?: string; transcriptionProfile?: string }
   ): Promise<VideoProject> => {
     const res = await importFromUrl(url, platform, {
       language: options?.language,
       whisperModel: settings.whisperModel,
+      transcriptionProfile: options?.transcriptionProfile || settings.transcriptionProfile,
       geminiApiKey: settings.geminiApiKey,
       openaiApiKey: settings.openaiApiKey,
     });
@@ -606,11 +705,13 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       height: res.height,
       fps: res.fps,
       fileSizeMb: res.fileSizeMb,
-      status: 'analyzing',
-      progress: 15,
-      currentStage: `Importing ${platform.toUpperCase()} stream on backend...`,
+      status: 'QUEUED',
+      importState: res.importState || 'QUEUED',
+      progress: 0,
+      currentStage: `QUEUED: Preparing ${platform.toUpperCase()} stream download...`,
       activeJobId: res.jobId,
       sourceLanguage: options?.language,
+      whisperProfile: options?.transcriptionProfile || settings.transcriptionProfile,
       transcripts: [],
       highlights: [],
       selectedClipIds: [],
@@ -622,7 +723,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     setProjects((prev) => [newProj, ...prev]);
     setActiveProject(newProj);
     setCurrentView('processing');
-    showToast(`Imported ${platform.toUpperCase()} video. Processing started.`);
+    showToast(`Queued ${platform.toUpperCase()} import. Background download started.`);
 
     // Connect WebSocket
     if (activeWsRef.current) {
@@ -645,10 +746,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
               totalBytes: data.total_bytes ?? p.totalBytes,
               speedBps: data.speed_bps ?? p.speedBps,
               etaSeconds: data.eta_seconds ?? p.etaSeconds,
+              elapsedSeconds: data.elapsed_seconds ?? p.elapsedSeconds,
               canResume: data.can_resume ?? p.canResume,
               transcribedSeconds: data.transcribed_seconds ?? p.transcribedSeconds,
               totalAudioSeconds: data.total_audio_seconds ?? p.totalAudioSeconds,
               whisperModel: data.whisper_model ?? p.whisperModel,
+              whisperProfile: data.whisper_profile ?? p.whisperProfile,
               whisperDevice: data.whisper_device ?? p.whisperDevice,
               realtimeFactor: data.realtime_factor ?? p.realtimeFactor,
             };
@@ -667,18 +770,27 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
             totalBytes: data.total_bytes ?? prev.totalBytes,
             speedBps: data.speed_bps ?? prev.speedBps,
             etaSeconds: data.eta_seconds ?? prev.etaSeconds,
+            elapsedSeconds: data.elapsed_seconds ?? prev.elapsedSeconds,
             canResume: data.can_resume ?? prev.canResume,
             transcribedSeconds: data.transcribed_seconds ?? prev.transcribedSeconds,
             totalAudioSeconds: data.total_audio_seconds ?? prev.totalAudioSeconds,
             whisperModel: data.whisper_model ?? prev.whisperModel,
+            whisperProfile: data.whisper_profile ?? prev.whisperProfile,
             whisperDevice: data.whisper_device ?? prev.whisperDevice,
             realtimeFactor: data.realtime_factor ?? prev.realtimeFactor,
           };
         });
 
-        if (data.progress >= 100 || data.status === 'ready' || data.status === 'COMPLETED') {
+        const lowSt = String(data.status || '').toLowerCase();
+        if (data.progress >= 100 || ['ready', 'completed', 'failed', 'cancelled'].includes(lowSt)) {
           syncJobDetails(res.jobId);
         }
+      },
+      () => {
+        const poll = setInterval(async () => {
+          await syncJobDetails(res.jobId);
+        }, 2000);
+        setTimeout(() => clearInterval(poll), 12000);
       }
     );
 
@@ -748,6 +860,35 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const openEditorForHighlight = (project: VideoProject, highlight: HighlightMoment) => {
     setActiveProject(project);
     setActiveHighlight(highlight);
+    const clipStyle = highlight.subtitleStyle;
+    const clipWords = clipStyle?.translatedWords || clipStyle?.translated_words;
+    const clipSegs = clipStyle?.translatedSegments || clipStyle?.translated_segments;
+    const clipSubLang = clipStyle?.subtitleLanguage || clipStyle?.subtitle_language;
+    const clipProvider = clipStyle?.translationProvider || clipStyle?.translation_provider;
+    const clipPartial = Boolean(clipStyle?.translationPartial ?? clipStyle?.translation_partial);
+    const clipWarnings = clipStyle?.translationWarnings || clipStyle?.translation_warnings || [];
+    const isClipTranslated = Boolean(
+      clipWords && clipWords.length > 0 && clipSubLang && clipSubLang !== 'original'
+    );
+    const nonLatinLangs = ['ml', 'hi', 'ta', 'te', 'kn', 'ar', 'ja', 'ko'];
+    const indicLangs = ['ml', 'hi', 'ta', 'te', 'kn'];
+    const activeLang = isClipTranslated ? clipSubLang : project.detectedLanguage || project.sourceLanguage;
+    setSubtitleStyle((prev) => ({
+      ...prev,
+      enabled: clipStyle?.enabled !== undefined ? Boolean(clipStyle.enabled) : prev.enabled,
+      translatedWords: isClipTranslated ? clipWords : undefined,
+      translatedSegments: isClipTranslated ? clipSegs : undefined,
+      isTranslated: isClipTranslated,
+      subtitleLanguage: isClipTranslated ? clipSubLang : 'original',
+      translationProvider: isClipTranslated ? clipProvider : undefined,
+      translationPartial: isClipTranslated ? clipPartial : false,
+      translationWarnings: isClipTranslated ? clipWarnings : [],
+      fontFamily:
+        clipStyle?.fontFamily ||
+        clipStyle?.font ||
+        (activeLang && indicLangs.includes(activeLang) ? 'Nirmala UI' : prev.fontFamily),
+      isUppercase: activeLang && nonLatinLangs.includes(activeLang) ? false : prev.isUppercase,
+    }));
     if (project.activeJobId) {
       syncJobDetails(project.activeJobId, true);
     }
@@ -789,6 +930,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         pipCorner: layoutConfig.pipCorner,
       },
       subtitle_style: subtitleStyle,
+      burn_subtitles: subtitleStyle.enabled !== false,
       prefer_hardware: settings.hardwareAcceleration,
       bitrate_kbps: settings.targetBitrate,
       fps: 30,
@@ -890,6 +1032,11 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       showToast('Select a clip first to translate its subtitles');
       return;
     }
+    if (activeProject?.isDemo) {
+      const msg = 'Demo sample clips cannot be translated on the backend. Import a real video first.';
+      showToast(msg);
+      throw new Error(msg);
+    }
     try {
       const res = await translateClipSubtitles(activeHighlight.id, targetLanguage, {
         geminiApiKey: settings.geminiApiKey,
@@ -897,29 +1044,61 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       });
 
       const isReset = targetLanguage === 'original' || targetLanguage === 'source';
-      const updatedWords = isReset ? [] : (res.translated_words || []);
+      const updatedWords = isReset ? undefined : (res.translated_words || []);
+      const updatedSegments = isReset ? undefined : (res.translated_segments || []);
       const newFont = res.subtitle_style?.font || res.subtitle_style?.fontFamily || subtitleStyle.fontFamily;
+      const nonLatinLangs = ['ml', 'hi', 'ta', 'te', 'kn', 'ar', 'ja', 'ko'];
+      const effectiveTarget = isReset ? 'original' : (res.target_language || targetLanguage);
 
       setSubtitleStyle((prev) => ({
         ...prev,
-        subtitleLanguage: targetLanguage,
+        subtitleLanguage: effectiveTarget,
         translatedWords: updatedWords,
-        isTranslated: !isReset,
+        translatedSegments: updatedSegments,
+        isTranslated: !isReset && Boolean(updatedWords && updatedWords.length > 0),
+        translationProvider: isReset ? undefined : res.provider,
+        translationPartial: isReset ? false : Boolean(res.partial),
+        translationWarnings: isReset ? [] : (res.warnings || []),
         fontFamily: newFont,
+        isUppercase: !isReset && nonLatinLangs.includes(effectiveTarget) ? false : prev.isUppercase,
       }));
 
-      // Also persist to backend clip update
-      await updateClipOnBackend(activeHighlight.id, {
-        subtitle_style: {
-          ...subtitleStyle,
-          subtitleLanguage: targetLanguage,
-          translatedWords: updatedWords,
-          fontFamily: newFont,
-        },
-      });
+      // Keep activeHighlight and projects in sync with backend-persisted clip.subtitle_style
+      const persistedStyle = res.subtitle_style || {};
+      setActiveHighlight((prev) =>
+        prev && prev.id === activeHighlight.id ? { ...prev, subtitleStyle: persistedStyle } : prev
+      );
+      setActiveProject((prev) =>
+        prev
+          ? {
+              ...prev,
+              highlights: prev.highlights.map((h) =>
+                h.id === activeHighlight.id ? { ...h, subtitleStyle: persistedStyle } : h
+              ),
+            }
+          : prev
+      );
+      setProjects((prev) =>
+        prev.map((p) =>
+          p.id !== activeProject?.id
+            ? p
+            : {
+                ...p,
+                highlights: p.highlights.map((h) =>
+                  h.id === activeHighlight.id ? { ...h, subtitleStyle: persistedStyle } : h
+                ),
+              }
+        )
+      );
 
-      const langLabel = SUPPORTED_LANGUAGES[targetLanguage] || targetLanguage;
-      showToast(isReset ? 'Subtitles restored to original spoken language' : `Subtitles translated to ${langLabel}`);
+      const langLabel = SUPPORTED_LANGUAGES[effectiveTarget] || effectiveTarget;
+      if (isReset) {
+        showToast('Subtitles restored to original spoken language');
+      } else if (res.partial) {
+        showToast(`Partially translated to ${langLabel} (some segments failed — you can retry)`);
+      } else {
+        showToast(`Subtitles translated to ${langLabel}`);
+      }
     } catch (err: any) {
       showToast(`Translation failed: ${err?.message || err}`);
       throw err;

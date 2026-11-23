@@ -37,15 +37,21 @@ class Settings(BaseSettings):
 
     YTDLP_CONCURRENT_FRAGMENTS: int = 4
     YTDLP_SOCKET_TIMEOUT: int = 20
+    YTDLP_HTTP_CHUNK_SIZE_MB: int = 10
+    YTDLP_RETRIES: int = 5
+    YTDLP_FRAGMENT_RETRIES: int = 5
+    YTDLP_MAX_DOWNLOAD_SECONDS: int = 14400
+    YTDLP_STALL_TIMEOUT_SECONDS: int = 90
 
     FFMPEG_PATH: str = ""
     FFPROBE_PATH: str = ""
 
     WHISPER_MODEL: str = "base"
+    WHISPER_PROFILE: str = "balanced"
     WHISPER_DEVICE: str = "auto"
     WHISPER_COMPUTE_TYPE: str = "auto"
     WHISPER_CPU_THREADS: int = 0
-    WHISPER_BEAM_SIZE: int = 2
+    WHISPER_BEAM_SIZE: int = 1
     WHISPER_CHUNK_SECONDS: int = 600
 
     MAX_CONCURRENT_IMPORTS: int = 1

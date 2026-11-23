@@ -5,6 +5,7 @@ import {
   RotateCcw,
   Scissors,
   Volume2,
+  VolumeX,
 } from 'lucide-react';
 
 interface TimelineScrubberProps {
@@ -13,7 +14,12 @@ interface TimelineScrubberProps {
   currentTime: number;
   maxDuration: number;
   isPlaying: boolean;
+  isMuted?: boolean;
+  volume?: number;
+  hasAudio?: boolean;
   onPlayPause: () => void;
+  onToggleMute?: () => void;
+  onVolumeChange?: (volume: number) => void;
   onSeek: (time: number) => void;
   onAdjustStart: (delta: number) => void;
   onAdjustEnd: (delta: number) => void;
@@ -25,7 +31,12 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
   currentTime,
   maxDuration,
   isPlaying,
+  isMuted = false,
+  volume = 1,
+  hasAudio = true,
   onPlayPause,
+  onToggleMute,
+  onVolumeChange,
   onSeek,
   onAdjustStart,
   onAdjustEnd,
@@ -60,6 +71,38 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
           >
             <RotateCcw className="w-4 h-4" />
           </button>
+
+          {hasAudio ? (
+            <div className="flex items-center gap-2 px-2.5 py-1.5 rounded-xl bg-[#181b28] border border-[#23283b]">
+              <button
+                type="button"
+                onClick={onToggleMute}
+                title={isMuted || volume === 0 ? 'Unmute audio' : 'Mute audio'}
+                className="text-slate-300 hover:text-white transition-colors"
+              >
+                {isMuted || volume === 0 ? (
+                  <VolumeX className="w-4 h-4 text-red-400" />
+                ) : (
+                  <Volume2 className="w-4 h-4 text-cyan-400" />
+                )}
+              </button>
+              <input
+                type="range"
+                min="0"
+                max="1"
+                step="0.05"
+                aria-label="Preview volume"
+                value={isMuted ? 0 : volume}
+                onChange={(e) => onVolumeChange?.(parseFloat(e.target.value))}
+                className="w-16 sm:w-20 accent-cyan-400 cursor-pointer h-1.5"
+              />
+            </div>
+          ) : (
+            <span className="flex items-center gap-1 px-2.5 py-1.5 rounded-xl bg-[#181b28] border border-[#23283b] text-[11px] text-slate-400">
+              <VolumeX className="w-3.5 h-3.5 text-slate-500" />
+              <span>No audio</span>
+            </span>
+          )}
         </div>
 
         <div className="flex items-center gap-4 text-xs font-mono">

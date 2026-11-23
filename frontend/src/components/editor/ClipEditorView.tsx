@@ -20,6 +20,8 @@ export const ClipEditorView: React.FC = () => {
     activeHighlight,
     setActiveHighlight,
     setCurrentView,
+    subtitleStyle,
+    setSubtitleStyle,
     exportCurrentHighlight,
     showToast,
   } = useApp();
@@ -29,16 +31,22 @@ export const ClipEditorView: React.FC = () => {
   const [currentTime, setCurrentTime] = useState(0);
   const [clipTitle, setClipTitle] = useState('');
   const [isExporting, setIsExporting] = useState(false);
+  const [isMuted, setIsMuted] = useState(false);
+  const [volume, setVolume] = useState(1);
+  const [seekVersion, setSeekVersion] = useState(0);
 
   useEffect(() => {
     if (activeHighlight) {
       setClipTitle(activeHighlight.title);
       setCurrentTime(activeHighlight.startTime);
+      setSeekVersion((v) => v + 1);
+      setIsPlaying(false);
     }
-  }, [activeHighlight]);
+  }, [activeHighlight?.id]);
 
-  // Loop playback inside the active clip boundaries
+  // Fallback timer ONLY when there is no real video URL (e.g. demo sample without media)
   useEffect(() => {
+    if (activeProject?.localVideoUrl) return;
     let animId: number;
     let lastStamp = performance.now();
 
@@ -60,7 +68,7 @@ export const ClipEditorView: React.FC = () => {
 
     animId = requestAnimationFrame(loop);
     return () => cancelAnimationFrame(animId);
-  }, [isPlaying, activeHighlight]);
+  }, [isPlaying, activeHighlight, activeProject?.localVideoUrl]);
 
   if (!activeProject || !activeHighlight) {
     return (
@@ -89,6 +97,26 @@ export const ClipEditorView: React.FC = () => {
     }
   };
 
+  const handleSeek = (targetTime: number) => {
+    const clamped = Math.max(activeHighlight.startTime, Math.min(activeHighlight.endTime, targetTime));
+    setCurrentTime(clamped);
+    setSeekVersion((v) => v + 1);
+  };
+
+  const handleToggleMute = () => {
+    setIsMuted((prev) => !prev);
+  };
+
+  const handleVolumeChange = (nextVolume: number) => {
+    const clamped = Math.min(1, Math.max(0, nextVolume));
+    setVolume(clamped);
+    if (clamped > 0 && isMuted) {
+      setIsMuted(false);
+    } else if (clamped === 0 && !isMuted) {
+      setIsMuted(true);
+    }
+  };
+
   const handleAdjustStart = (delta: number) => {
     const newStart = Math.max(0, Math.min(activeHighlight.endTime - 3, activeHighlight.startTime + delta));
     const newDur = Math.max(3, activeHighlight.endTime - newStart);
@@ -97,6 +125,10 @@ export const ClipEditorView: React.FC = () => {
       startTime: newStart,
       duration: newDur,
     });
+    if (currentTime < newStart || currentTime > activeHighlight.endTime) {
+      setCurrentTime(newStart);
+      setSeekVersion((v) => v + 1);
+    }
     if (!activeProject.isDemo) {
       updateClipOnBackend(activeHighlight.id, { start_time: newStart, end_time: activeHighlight.endTime }).catch(() => {});
     }
@@ -110,9 +142,29 @@ export const ClipEditorView: React.FC = () => {
       endTime: newEnd,
       duration: newDur,
     });
+    if (currentTime > newEnd || currentTime < activeHighlight.startTime) {
+      setCurrentTime(activeHighlight.startTime);
+      setSeekVersion((v) => v + 1);
+    }
     if (!activeProject.isDemo) {
       updateClipOnBackend(activeHighlight.id, { start_time: activeHighlight.startTime, end_time: newEnd }).catch(() => {});
     }
+  };
+
+  const subtitlesOn = subtitleStyle.enabled !== false;
+
+  const handleToggleSubtitles = () => {
+    const nextEnabled = !subtitlesOn;
+    setSubtitleStyle((prev) => ({ ...prev, enabled: nextEnabled }));
+    if (activeProject && activeHighlight && !activeProject.isDemo) {
+      updateClipOnBackend(activeHighlight.id, {
+        subtitle_style: {
+          ...(activeHighlight.subtitleStyle || {}),
+          enabled: nextEnabled,
+        },
+      }).catch(() => {});
+    }
+    showToast(nextEnabled ? 'Subtitles turned ON (preview & export)' : 'Subtitles turned OFF (preview & export)');
   };
 
   return (
@@ -160,23 +212,48 @@ export const ClipEditorView: React.FC = () => {
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">
         {/* Left Column: 9:16 Vertical Preview Phone Canvas */}
         <div className="lg:col-span-5 flex flex-col items-center justify-center p-6 rounded-3xl bg-[#0e1017] border border-[#212638] shadow-2xl space-y-4">
-          <div className="flex items-center justify-between w-full px-2 text-xs text-slate-400">
+          <div className="flex items-center justify-between w-full px-2 text-xs text-slate-400 gap-2">
             <span className="font-semibold text-slate-300 flex items-center gap-1.5">
               <Sparkles className="w-3.5 h-3.5 text-purple-400" />
               Vertical 9:16 Live Canvas
             </span>
-            <span className="font-mono text-[11px] text-cyan-400">1080×1920</span>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={handleToggleSubtitles}
+                aria-pressed={subtitlesOn}
+                className={`flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-[11px] font-bold border transition-colors ${
+                  subtitlesOn
+                    ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/40 hover:bg-emerald-500/25'
+                    : 'bg-slate-800/80 text-slate-400 border-slate-700 hover:text-white'
+                }`}
+                title="Toggle subtitles in preview and exported video without deleting transcript data"
+              >
+                <Type className="w-3 h-3" />
+                <span>Subtitles: {subtitlesOn ? 'ON' : 'OFF'}</span>
+              </button>
+              <span className="font-mono text-[11px] text-cyan-400">1080×1920</span>
+            </div>
           </div>
 
           <VerticalPreview
             currentTime={currentTime}
             isPlaying={isPlaying}
+            startTime={activeHighlight.startTime}
+            endTime={activeHighlight.endTime}
+            isMuted={isMuted}
+            volume={volume}
+            hasAudio={activeProject.hasAudio !== false}
+            seekVersion={seekVersion}
             onTimeUpdate={(t) => setCurrentTime(t)}
+            onAudioError={(msg) => showToast(msg)}
             videoUrl={activeProject.localVideoUrl}
           />
 
           <p className="text-[11px] text-slate-400 text-center max-w-xs">
-            Live preview simulates default Facecam Top + Gameplay Bottom (~3:4) with synchronized animated word subtitles.
+            {subtitlesOn
+              ? 'Live preview simulates 9:16 layout with synchronized subtitles (included in export).'
+              : 'Subtitles are OFF — hidden in preview and excluded from export. Transcript & translations are preserved.'}
           </p>
         </div>
 
@@ -238,7 +315,7 @@ export const ClipEditorView: React.FC = () => {
           ) : (
             <MetadataControls
               currentTime={currentTime}
-              onSeek={(t) => setCurrentTime(t)}
+              onSeek={handleSeek}
             />
           )}
 
@@ -249,8 +326,13 @@ export const ClipEditorView: React.FC = () => {
             currentTime={currentTime}
             maxDuration={activeProject.duration}
             isPlaying={isPlaying}
+            isMuted={isMuted}
+            volume={volume}
+            hasAudio={activeProject.hasAudio !== false}
             onPlayPause={() => setIsPlaying(!isPlaying)}
-            onSeek={(t) => setCurrentTime(t)}
+            onToggleMute={handleToggleMute}
+            onVolumeChange={handleVolumeChange}
+            onSeek={handleSeek}
             onAdjustStart={handleAdjustStart}
             onAdjustEnd={handleAdjustEnd}
           />

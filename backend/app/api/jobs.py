@@ -78,6 +78,8 @@ async def list_jobs(db: AsyncSession = Depends(get_db)):
             "total_bytes": opts.get("total_bytes"),
             "speed_bps": opts.get("speed_bps", 0.0),
             "eta_seconds": opts.get("eta_seconds"),
+            "elapsed_seconds": opts.get("elapsed_seconds", 0.0),
+            "whisper_profile": opts.get("whisper_profile") or opts.get("transcription_profile") or "balanced",
             "can_resume": bool(opts.get("can_resume", False)),
             "video_url": f"/api/videos/{j.video_id}/stream" if j.video else None,
             "clips_count": int(count or 0),
@@ -107,10 +109,12 @@ async def get_job(id: str, include_words: bool = Query(False), db: AsyncSession 
         "detected_language": getattr(job, "detected_language", None) or opts.get("detected_language"),
         "detected_language_probability": opts.get("detected_language_probability"),
         "whisper_model": opts.get("whisper_model") or "base",
+        "whisper_profile": opts.get("whisper_profile") or opts.get("transcription_profile") or "balanced",
         "whisper_device": opts.get("whisper_device"),
         "transcribed_seconds": opts.get("transcribed_seconds", 0.0),
         "total_audio_seconds": opts.get("total_audio_seconds", v.duration if v else 0.0),
         "realtime_factor": opts.get("realtime_factor", 0.0),
+        "elapsed_seconds": opts.get("elapsed_seconds", 0.0),
         "warnings": opts.get("warnings", []),
         "bytes_transferred": opts.get("bytes_transferred", 0),
         "total_bytes": opts.get("total_bytes"),
@@ -151,12 +155,12 @@ async def start_job(id: str, db: AsyncSession = Depends(get_db)):
     from pathlib import Path
     has_source_file = bool(job.video and job.video.file_path and Path(job.video.file_path).exists())
     if source_url and not has_source_file:
-        job.status, job.progress, job.current_stage, job.error_message = "QUEUED", 0, "QUEUED: Retrying stream download", None
+        job.status, job.progress, job.current_stage, job.error_message = "queued", 0, "QUEUED: Retrying stream download", None
         opts["import_state"] = "QUEUED"
         job.settings = opts
         await db.commit()
         job_runner.start_url_import(job.id, source_url)
-        return {"message": "Import retry started", "status": "QUEUED"}
+        return {"message": "Import retry started", "status": "queued"}
 
     job.status, job.progress, job.current_stage, job.error_message = "queued", 0, "Queued for analysis", None
     await db.commit()
@@ -167,37 +171,40 @@ async def start_job(id: str, db: AsyncSession = Depends(get_db)):
 @router.post("/{id}/cancel")
 async def cancel_job(id: str, db: AsyncSession = Depends(get_db)):
     job = await _job(db, id, with_rel=False)
-    if job.status not in job_runner.ACTIVE_STATUSES:
+    if job.status.lower() not in job_runner.ACTIVE_STATUSES:
         raise HTTPException(status_code=409, detail=f"Job is not running (status: {job.status})")
     job_runner.cancelled.add(id)
+    from backend.app import video_import as vi
+    vi.terminate_download_process(id)
     opts = dict(job.settings or {})
     upload_id = opts.get("upload_id")
     if upload_id:
         import asyncio
-        from backend.app import video_import as vi
         await asyncio.to_thread(vi.cancel_chunked_upload, upload_id)
-    was_upper = job.status.isupper()
-    new_status = "CANCELLED" if was_upper else "cancelled"
-    job.status, job.current_stage = new_status, "CANCELLED: Cancelled by user" if was_upper else "Cancelling..."
+    job.status, job.current_stage = "cancelled", "CANCELLED: Cancelled by user"
     opts["import_state"] = "CANCELLED"
     opts["can_resume"] = False
     job.settings = opts
     await db.commit()
     await job_runner.broadcast(id, {
         "job_id": id,
-        "status": new_status,
+        "status": "cancelled",
         "import_state": "CANCELLED",
         "progress": job.progress,
         "stage": job.current_stage,
     })
-    return {"message": "Job cancelled", "status": new_status}
+    return {"message": "Job cancelled", "status": "cancelled"}
 
 
 @router.delete("/{id}")
 async def delete_job(id: str, db: AsyncSession = Depends(get_db)):
     job = await _job(db, id, with_rel=False)
-    if job.status in job_runner.ACTIVE_STATUSES:
+    if job.status.lower() in job_runner.ACTIVE_STATUSES or job_runner.is_running(id):
         job_runner.cancelled.add(id)
+        from backend.app import video_import as vi
+        vi.terminate_download_process(id)
+        import asyncio
+        await asyncio.sleep(0.15)
     video = (await db.execute(select(Video).where(Video.id == job.video_id))).scalar_one_or_none()
     if video:
         await purge_video(db, video)  # cascades to jobs/clips and removes files
@@ -219,7 +226,8 @@ async def export_clip(job_id: str, clip_id: str, req: ClipExportRequest, db: Asy
         "title": req.title, "start_time": req.start_time, "end_time": req.end_time,
         "layout": req.layout,
         "facecam_crop": req.facecam_crop, "gameplay_crop": req.gameplay_crop,
-        "subtitle_style": req.subtitle_style, "prefer_hardware": req.prefer_hardware,
+        "subtitle_style": req.subtitle_style, "burn_subtitles": req.burn_subtitles,
+        "prefer_hardware": req.prefer_hardware,
         "fps": req.fps, "bitrate_kbps": req.bitrate_kbps,
         "quality": req.quality, "audio_bitrate_kbps": req.audio_bitrate_kbps}.items() if v is not None}
     try:
@@ -262,6 +270,11 @@ async def websocket_progress(websocket: WebSocket, id: str):
     await websocket.accept()
     active_websockets.setdefault(id, []).append(websocket)
     try:
+        from backend.app.database import async_session_maker
+        async with async_session_maker() as s:
+            job = await s.get(Job, id)
+            if job:
+                await websocket.send_json(job_runner._build_ws_payload(job))
         while True:
             await websocket.receive_text()
     except WebSocketDisconnect:

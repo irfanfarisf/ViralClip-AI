@@ -83,7 +83,19 @@ export const SUPPORTED_LANGUAGES: Record<string, string> = {
 
 export type SubtitleAnimation = 'pop' | 'bounce' | 'scale_glow' | 'fade' | 'none';
 
+export interface TranslatedSubtitleSegment {
+  segment_id?: string | null;
+  start: number;
+  end: number;
+  original_text?: string;
+  text: string;
+  confidence?: number;
+  words?: TranscriptWord[];
+  language?: string;
+}
+
 export interface SubtitleStyle {
+  enabled: boolean;
   preset: SubtitlePreset;
   fontSize: 'sm' | 'md' | 'lg' | 'xl';
   fontFamily: 'Montserrat' | 'Inter' | 'Bebas Neue' | 'Impact' | 'Arial' | 'Roboto' | 'Nirmala UI' | 'Segoe UI' | 'Malgun Gothic' | string;
@@ -103,6 +115,10 @@ export interface SubtitleStyle {
   subtitleLanguage?: string;
   isTranslated?: boolean;
   translatedWords?: TranscriptWord[];
+  translatedSegments?: TranslatedSubtitleSegment[];
+  translationProvider?: string;
+  translationPartial?: boolean;
+  translationWarnings?: string[];
 }
 
 export interface LayoutConfig {
@@ -151,6 +167,16 @@ export interface HighlightMoment {
   suggestedDescription?: string;
   thumbnailText?: string;
   thumbnailTimestamp?: number;
+  subtitleStyle?: Partial<SubtitleStyle> & {
+    translated_words?: TranscriptWord[];
+    translated_segments?: TranslatedSubtitleSegment[];
+    subtitle_language?: string;
+    is_translated?: boolean;
+    translation_provider?: string;
+    translation_partial?: boolean;
+    translation_warnings?: string[];
+    font?: string;
+  };
 }
 
 export interface ExportedClip {
@@ -171,6 +197,16 @@ export interface ExportedClip {
   titleSuggestions?: string[];
   thumbnailText?: string;
   thumbnailTimestamp?: number;
+  subtitleStyle?: Partial<SubtitleStyle> & {
+    translated_words?: TranscriptWord[];
+    translated_segments?: TranslatedSubtitleSegment[];
+    subtitle_language?: string;
+    is_translated?: boolean;
+    translation_provider?: string;
+    translation_partial?: boolean;
+    translation_warnings?: string[];
+    font?: string;
+  };
 }
 
 export interface VideoProject {
@@ -184,6 +220,7 @@ export interface VideoProject {
   height: number;
   fps: number;
   fileSizeMb?: number;
+  hasAudio?: boolean;
   status: JobStatus;
   importState?: string;
   progress: number;
@@ -198,8 +235,10 @@ export interface VideoProject {
   transcribedSeconds?: number;
   totalAudioSeconds?: number;
   whisperModel?: string;
+  whisperProfile?: string;
   whisperDevice?: string;
   realtimeFactor?: number;
+  elapsedSeconds?: number;
   detectedLanguage?: string;
   detectedLanguageProbability?: number;
   sourceLanguage?: string;
@@ -213,10 +252,13 @@ export interface VideoProject {
   exportedClips: ExportedClip[];
 }
 
+export type TranscriptionProfile = 'speed' | 'balanced' | 'accuracy';
+
 export interface AppSettings {
   geminiApiKey: string; // Kept in memory, never in localStorage
   openaiApiKey: string; // Kept in memory, never in localStorage
-  whisperModel: 'tiny' | 'base' | 'small' | 'medium';
+  whisperModel: 'tiny' | 'base' | 'small' | 'medium' | 'large-v3';
+  transcriptionProfile: TranscriptionProfile;
   device: 'cpu' | 'cuda';
   defaultLayout: LayoutPreset;
   defaultSubtitlePreset: SubtitlePreset;

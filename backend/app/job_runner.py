@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import re
 import shutil
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -40,12 +41,21 @@ IMPORT_STATES = (
 ACTIVE_STATUSES = tuple(ACTIVE_JOB_STATUSES)
 
 active_websockets: Dict[str, List[Any]] = {}
-active_url_imports: Dict[str, str] = {}  # normalized_url -> job_id
+active_url_imports: Dict[str, str] = {}  # canonical_url -> job_id
 cancelled: set[str] = set()
 _tasks: set[asyncio.Task] = set()
+_job_locks: Dict[str, asyncio.Lock] = {}
 _heavy: Optional[asyncio.Semaphore] = None
 _import_sem_inst: Optional[asyncio.Semaphore] = None
 _export_sem_inst: Optional[asyncio.Semaphore] = None
+
+
+def _get_job_lock(job_id: str) -> asyncio.Lock:
+    lock = _job_locks.get(job_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _job_locks[job_id] = lock
+    return lock
 
 
 def _sem() -> asyncio.Semaphore:
@@ -105,7 +115,7 @@ def is_running(job_id: str) -> bool:
 
 
 def get_active_url_job(url: str) -> Optional[str]:
-    norm = url.strip()
+    norm = vi.normalize_url(url)
     jid = active_url_imports.get(norm)
     if jid and jid in running:
         return jid
@@ -131,10 +141,10 @@ def start_pipeline(job_id: str, gemini_api_key: Optional[str] = None, openai_api
 
 def start_url_import(job_id: str, url: str, gemini_api_key: Optional[str] = None, openai_api_key: Optional[str] = None) -> bool:
     """Queue a background URL download & metadata import job; prevents duplicate workers."""
-    norm = url.strip()
+    norm = vi.normalize_url(url)
     if job_id in running:
         return False
-    existing = get_active_url_job(norm)
+    existing = get_active_url_job(url)
     if existing and existing != job_id:
         return False
     running.add(job_id)
@@ -142,7 +152,7 @@ def start_url_import(job_id: str, url: str, gemini_api_key: Optional[str] = None
 
     async def _wrapped():
         try:
-            await run_url_import(job_id, norm, gemini_api_key=gemini_api_key, openai_api_key=openai_api_key)
+            await run_url_import(job_id, url.strip(), gemini_api_key=gemini_api_key, openai_api_key=openai_api_key, canonical_url=norm)
         finally:
             running.discard(job_id)
             if active_url_imports.get(norm) == job_id:
@@ -152,64 +162,104 @@ def start_url_import(job_id: str, url: str, gemini_api_key: Optional[str] = None
     return True
 
 
+async def shutdown_cleanup() -> None:
+    """Cancel active jobs and terminate external download subprocess trees on server shutdown."""
+    for jid in list(running):
+        cancelled.add(jid)
+    vi.terminate_all_download_processes()
+    for t in list(_tasks):
+        t.cancel()
+    if _tasks:
+        await asyncio.gather(*list(_tasks), return_exceptions=True)
+
+
 async def broadcast(key: str, payload: dict) -> None:
-    for ws in list(active_websockets.get(key, [])):
+    conns = active_websockets.get(key)
+    if not conns:
+        return
+    dead: List[Any] = []
+    for ws in list(conns):
         try:
             await ws.send_json(payload)
         except Exception:
-            pass
+            dead.append(ws)
+    if dead:
+        for ws in dead:
+            if ws in conns:
+                conns.remove(ws)
+        if not conns:
+            active_websockets.pop(key, None)
+
+
+def _build_ws_payload(job: Job) -> dict:
+    opts = job.settings or {}
+    return {
+        "job_id": job.id,
+        "status": job.status,
+        "import_state": opts.get("import_state", to_import_state(job.status)),
+        "progress": job.progress,
+        "stage": job.current_stage,
+        "error": job.error_message,
+        "bytes_transferred": opts.get("bytes_transferred", 0),
+        "total_bytes": opts.get("total_bytes"),
+        "speed_bps": opts.get("speed_bps", 0.0),
+        "eta_seconds": opts.get("eta_seconds"),
+        "elapsed_seconds": opts.get("elapsed_seconds", 0.0),
+        "chunks_received": opts.get("chunks_received", 0),
+        "total_chunks": opts.get("total_chunks", 0),
+        "can_resume": bool(opts.get("can_resume", False)),
+        "transcribed_seconds": opts.get("transcribed_seconds", 0.0),
+        "total_audio_seconds": opts.get("total_audio_seconds", 0.0),
+        "whisper_model": opts.get("whisper_model") or settings.WHISPER_MODEL or "base",
+        "whisper_profile": opts.get("whisper_profile") or opts.get("transcription_profile") or settings.WHISPER_PROFILE or "balanced",
+        "whisper_device": opts.get("whisper_device"),
+        "realtime_factor": opts.get("realtime_factor", 0.0),
+        "detected_language": getattr(job, "detected_language", None) or opts.get("detected_language"),
+        "detected_language_probability": opts.get("detected_language_probability"),
+    }
 
 
 async def set_job(job_id: str, *, status: Optional[str] = None, progress: Optional[int] = None,
                   stage: Optional[str] = None, error: Optional[str] = None,
                   telemetry: Optional[dict] = None, **fields) -> None:
-    async with async_session_maker() as s:
-        job = await s.get(Job, job_id)
-        if not job:
-            return
-        if status is not None:
-            job.status = status.lower()
-        if progress is not None:
-            job.progress = progress
-        if stage is not None:
-            job.current_stage = stage
-        if error is not None:
-            job.error_message = error
-        if telemetry:
-            cur_settings = dict(job.settings or {})
-            cur_settings.update(telemetry)
-            job.settings = cur_settings
-        for k, v in fields.items():
-            setattr(job, k, v)
-        await s.commit()
-        opts = job.settings or {}
-        payload = {
-            "job_id": job.id,
-            "status": job.status,
-            "import_state": opts.get("import_state", to_import_state(job.status)),
-            "progress": job.progress,
-            "stage": job.current_stage,
-            "error": job.error_message,
-            "bytes_transferred": opts.get("bytes_transferred", 0),
-            "total_bytes": opts.get("total_bytes"),
-            "speed_bps": opts.get("speed_bps", 0.0),
-            "eta_seconds": opts.get("eta_seconds"),
-            "chunks_received": opts.get("chunks_received", 0),
-            "total_chunks": opts.get("total_chunks", 0),
-            "can_resume": bool(opts.get("can_resume", False)),
-            "transcribed_seconds": opts.get("transcribed_seconds", 0.0),
-            "total_audio_seconds": opts.get("total_audio_seconds", 0.0),
-            "whisper_model": opts.get("whisper_model") or settings.WHISPER_MODEL or "base",
-            "whisper_device": opts.get("whisper_device"),
-            "realtime_factor": opts.get("realtime_factor", 0.0),
-            "detected_language": getattr(job, "detected_language", None) or opts.get("detected_language"),
-            "detected_language_probability": opts.get("detected_language_probability"),
-        }
+    async with _get_job_lock(job_id):
+        async with async_session_maker() as s:
+            job = await s.get(Job, job_id)
+            if not job:
+                return
+            # Prevent late non-terminal ticks from overwriting a terminal cancelled/failed/completed state
+            if status is not None and job.status in ("cancelled", "failed", "completed", "ready"):
+                if status.lower() in ("initializing", "downloading", "uploading", "validating", "extracting_metadata"):
+                    return
+            if status is not None:
+                job.status = status.lower()
+            if progress is not None:
+                job.progress = progress
+            if stage is not None:
+                job.current_stage = stage
+            if error is not None:
+                job.error_message = error
+            if telemetry:
+                cur_settings = dict(job.settings or {})
+                cur_settings.update(telemetry)
+                job.settings = cur_settings
+            for k, v in fields.items():
+                setattr(job, k, v)
+            await s.commit()
+            payload = _build_ws_payload(job)
     await broadcast(job_id, payload)
 
 
-async def run_url_import(job_id: str, url: str, gemini_api_key: Optional[str] = None, openai_api_key: Optional[str] = None) -> None:
+async def run_url_import(
+    job_id: str,
+    url: str,
+    gemini_api_key: Optional[str] = None,
+    openai_api_key: Optional[str] = None,
+    canonical_url: Optional[str] = None,
+) -> None:
     """Background worker for YouTube/Twitch URL imports using yt-dlp with progress hooks & resume support."""
+    should_analyze = False
+    canon = canonical_url or vi.normalize_url(url)
     async with _import_sem():
         cancelled.discard(job_id)
         async with async_session_maker() as s:
@@ -223,7 +273,9 @@ async def run_url_import(job_id: str, url: str, gemini_api_key: Optional[str] = 
 
         dest_dir = vi.storage_dir_for(video_id)
         loop = asyncio.get_running_loop()
-        last_emit = {"t": 0.0, "stage": ""}
+        t_start = time.monotonic()
+        last_emit = {"ws_t": 0.0, "db_t": 0.0, "stage": ""}
+        emit_lock = __import__("threading").Lock()
 
         await set_job(
             job_id,
@@ -231,16 +283,22 @@ async def run_url_import(job_id: str, url: str, gemini_api_key: Optional[str] = 
             progress=2,
             stage="INITIALIZING: Preparing stream download",
             error="",
-            telemetry={"import_state": "INITIALIZING", "source_url": url, "can_resume": True},
+            telemetry={"import_state": "INITIALIZING", "source_url": url, "elapsed_seconds": 0.0, "can_resume": True},
         )
 
         def on_progress(p: vi.ImportProgress) -> None:
-            import time as _t
-            now = _t.monotonic()
-            if p.stage == last_emit["stage"] and (now - last_emit["t"]) < 0.25 and p.progress < 90:
-                return
-            last_emit["t"] = now
-            last_emit["stage"] = p.stage
+            now = time.monotonic()
+            elapsed_s = round(now - t_start, 1)
+            with emit_lock:
+                stage_changed = p.stage != last_emit["stage"]
+                if not stage_changed and (now - last_emit["ws_t"]) < 0.25 and p.progress < 90:
+                    return
+                last_emit["ws_t"] = now
+                persist_db = stage_changed or p.progress >= 90 or (now - last_emit["db_t"]) >= 2.0
+                if persist_db:
+                    last_emit["db_t"] = now
+                    last_emit["stage"] = p.stage
+
             stage_msg = p.message or p.stage
             if p.stage == "DOWNLOADING" and p.speed_bps > 0:
                 mb_s = p.speed_bps / (1024 * 1024)
@@ -251,23 +309,41 @@ async def run_url_import(job_id: str, url: str, gemini_api_key: Optional[str] = 
                     stage_msg = f"DOWNLOADING: {dl_mb:.1f}/{tot_mb:.1f} MB ({mb_s:.1f} MB/s{eta_str})"
                 else:
                     stage_msg = f"DOWNLOADING: {dl_mb:.1f} MB ({mb_s:.1f} MB/s)"
-            asyncio.run_coroutine_threadsafe(
-                set_job(
-                    job_id,
-                    status=p.stage,
-                    progress=p.progress,
-                    stage=stage_msg,
-                    telemetry={
+
+            tel_data = {
+                "import_state": p.stage,
+                "bytes_transferred": p.bytes_transferred,
+                "total_bytes": p.total_bytes,
+                "speed_bps": p.speed_bps,
+                "eta_seconds": p.eta_seconds,
+                "elapsed_seconds": elapsed_s,
+                "chunks_received": p.chunks_received,
+                "total_chunks": p.total_chunks,
+                "can_resume": True,
+            }
+            if persist_db:
+                asyncio.run_coroutine_threadsafe(
+                    set_job(
+                        job_id,
+                        status=p.stage,
+                        progress=p.progress,
+                        stage=stage_msg,
+                        telemetry=tel_data,
+                    ),
+                    loop,
+                )
+            else:
+                asyncio.run_coroutine_threadsafe(
+                    broadcast(job_id, {
+                        "job_id": job_id,
+                        "status": p.stage.lower(),
                         "import_state": p.stage,
-                        "bytes_transferred": p.bytes_transferred,
-                        "total_bytes": p.total_bytes,
-                        "speed_bps": p.speed_bps,
-                        "eta_seconds": p.eta_seconds,
-                        "can_resume": True,
-                    },
-                ),
-                loop,
-            )
+                        "progress": p.progress,
+                        "stage": stage_msg,
+                        **tel_data,
+                    }),
+                    loop,
+                )
 
         try:
             path, meta, platform, title = await asyncio.to_thread(
@@ -277,6 +353,7 @@ async def run_url_import(job_id: str, url: str, gemini_api_key: Optional[str] = 
                 progress_cb=on_progress,
                 should_cancel=lambda: job_id in cancelled,
                 keep_partial_on_error=True,
+                job_id=job_id,
             )
             _check(job_id)
 
@@ -298,6 +375,7 @@ async def run_url_import(job_id: str, url: str, gemini_api_key: Optional[str] = 
                     video.status = "ready"
                     await s.commit()
 
+            elapsed_total = round(time.monotonic() - t_start, 1)
             await set_job(
                 job_id,
                 status="COMPLETED",
@@ -310,25 +388,24 @@ async def run_url_import(job_id: str, url: str, gemini_api_key: Optional[str] = 
                     "total_bytes": meta.file_size_bytes,
                     "speed_bps": 0.0,
                     "eta_seconds": 0.0,
+                    "elapsed_seconds": elapsed_total,
                     "can_resume": False,
                 },
             )
-
-            # Only start Whisper/analysis if explicitly requested via auto_analyze
-            if opts.get("auto_analyze", False):
-                await run_pipeline(job_id, gemini_api_key=gemini_api_key, openai_api_key=openai_api_key)
+            should_analyze = bool(opts.get("auto_analyze", False))
 
         except _Cancelled:
-            for p in dest_dir.glob("*.part*"):
-                p.unlink(missing_ok=True)
+            vi._cleanup_partial_downloads(dest_dir)
             await set_job(
                 job_id,
                 status="CANCELLED",
                 stage="CANCELLED: Import cancelled by user",
                 telemetry={"import_state": "CANCELLED", "can_resume": False},
             )
+            return
         except vi.ImportFailure as exc:
             if exc.status == 499 or job_id in cancelled:
+                vi._cleanup_partial_downloads(dest_dir)
                 await set_job(
                     job_id,
                     status="CANCELLED",
@@ -344,6 +421,7 @@ async def run_url_import(job_id: str, url: str, gemini_api_key: Optional[str] = 
                     error=exc.message,
                     telemetry={"import_state": "FAILED", "can_resume": has_parts, "retry_count": int(opts.get("retry_count", 0)) + 1},
                 )
+            return
         except Exception as exc:  # noqa: BLE001
             await set_job(
                 job_id,
@@ -352,8 +430,18 @@ async def run_url_import(job_id: str, url: str, gemini_api_key: Optional[str] = 
                 error=str(exc),
                 telemetry={"import_state": "FAILED", "can_resume": True},
             )
+            return
+
+    # Release _import_sem() and URL dedup lock BEFORE running Whisper analysis so other URL downloads aren't blocked
+    if active_url_imports.get(canon) == job_id:
+        active_url_imports.pop(canon, None)
+    if should_analyze:
+        try:
+            await run_pipeline(job_id, gemini_api_key=gemini_api_key, openai_api_key=openai_api_key)
         finally:
             cancelled.discard(job_id)
+    else:
+        cancelled.discard(job_id)
 
 
 class _Cancelled(Exception):
@@ -439,9 +527,11 @@ async def run_pipeline(job_id: str, gemini_api_key: Optional[str] = None, openai
             detected_lang = opts.get("detected_language")
             detected_lang_prob = float(opts.get("detected_language_probability") or 0.0)
             model_used = (opts.get("whisper_model") or settings.WHISPER_MODEL or "base").strip().lower()
+            profile_used = transcription.normalize_profile(opts.get("transcription_profile"))
             hw_info = transcription.detect_whisper_hardware()
             device_label = hw_info["label"]
             rtf_used = 0.0
+            done_sec = 0.0
 
             if has_audio and opts.get("transcribe", True):
                 # Check for resumable intermediate transcript checkpoint
@@ -474,10 +564,12 @@ async def run_pipeline(job_id: str, gemini_api_key: Optional[str] = None, openai
                     job_id,
                     status="transcribing",
                     progress=15,
-                    stage=f"Transcribing speech (Whisper {model_used} on {device_label})",
+                    stage=f"Transcribing speech (Whisper {model_used} • {profile_used.title()} on {device_label})",
                     telemetry={
                         "whisper_model": model_used,
+                        "whisper_profile": profile_used,
                         "whisper_device": device_label,
+                        "elapsed_seconds": 0.0,
                         "transcribed_seconds": round(resume_sec, 2),
                         "total_audio_seconds": round(duration, 2),
                     },
@@ -485,8 +577,7 @@ async def run_pipeline(job_id: str, gemini_api_key: Optional[str] = None, openai
                 last = {"p": -1, "t": 0.0}
 
                 def on_telemetry(t: dict) -> None:
-                    import time as _tm
-                    now = _tm.monotonic()
+                    now = time.monotonic()
                     frac = float(t.get("progress_fraction", 0.0))
                     pct = 15 + int(frac * 55)
                     if pct != last["p"] or (now - last["t"]) >= 0.6:
@@ -496,10 +587,11 @@ async def run_pipeline(job_id: str, gemini_api_key: Optional[str] = None, openai
                         tot_s = t.get("total_audio_seconds", duration)
                         rtf = t.get("realtime_factor", 0.0)
                         eta = t.get("eta_seconds")
+                        el_s = t.get("elapsed_seconds", 0.0)
                         eta_s = f", ETA {int(eta)}s" if eta is not None else ""
                         lbl = (
                             f"Transcribing speech ({int(frac * 100)}% • "
-                            f"{done_s:.0f}s/{tot_s:.0f}s • {model_used} [{t.get('whisper_device', device_label)}] • "
+                            f"{done_s:.0f}s/{tot_s:.0f}s • {model_used}/{profile_used} [{t.get('whisper_device', device_label)}] • "
                             f"{rtf:.1f}x RT{eta_s})"
                         )
                         asyncio.run_coroutine_threadsafe(
@@ -511,8 +603,10 @@ async def run_pipeline(job_id: str, gemini_api_key: Optional[str] = None, openai
                                     "transcribed_seconds": done_s,
                                     "total_audio_seconds": tot_s,
                                     "whisper_model": model_used,
+                                    "whisper_profile": profile_used,
                                     "whisper_device": t.get("whisper_device", device_label),
                                     "realtime_factor": rtf,
+                                    "elapsed_seconds": el_s,
                                     "eta_seconds": eta,
                                     "current_segment": t.get("current_segment"),
                                     "progress_percent": t.get("progress_percent"),
@@ -551,6 +645,7 @@ async def run_pipeline(job_id: str, gemini_api_key: Optional[str] = None, openai
                 def on_checkpoint(segs_snapshot: List[dict], sec_done: float) -> None:
                     asyncio.run_coroutine_threadsafe(_save_checkpoint(list(segs_snapshot), sec_done), loop)
 
+                transcription_completed = False
                 try:
                     transcribe_res = await asyncio.to_thread(
                         transcription.transcribe_audio,
@@ -564,6 +659,7 @@ async def run_pipeline(job_id: str, gemini_api_key: Optional[str] = None, openai
                         checkpoint_cb=on_checkpoint,
                         resume_from_sec=resume_sec,
                         initial_segments=initial_segs,
+                        profile=profile_used,
                     )
                     segments = list(transcribe_res)
                     if saved_count[0] < len(segments):
@@ -573,13 +669,37 @@ async def run_pipeline(job_id: str, gemini_api_key: Optional[str] = None, openai
                     model_used = getattr(transcribe_res, "model_name", model_used) or transcribe_res.get("model_name", model_used)
                     device_label = getattr(transcribe_res, "device_label", device_label) or device_label
                     rtf_used = float(getattr(transcribe_res, "realtime_factor", 0.0) or 0.0)
+                    transcription_completed = True
                 except InterruptedError:
                     raise _Cancelled()
                 except transcription.TranscriptionError as exc:
-                    warnings.append(f"Transcription unavailable, using audio-energy detection only: {exc}")
+                    async with async_session_maker() as s:
+                        saved = (await s.execute(
+                            select(TranscriptSegment)
+                            .where(TranscriptSegment.video_id == video_id)
+                            .order_by(TranscriptSegment.segment_index)
+                        )).scalars().all()
+                        if saved:
+                            segments = [
+                                {
+                                    "start": t.start_time,
+                                    "end": t.end_time,
+                                    "text": t.text,
+                                    "confidence": t.confidence,
+                                    "words": t.words,
+                                }
+                                for t in saved
+                            ]
+                    if segments:
+                        warnings.append(f"Partial transcript preserved ({len(segments)} segments); remaining audio error: {exc}")
+                    else:
+                        warnings.append(f"Transcription unavailable, using audio-energy detection only: {exc}")
                 if has_audio and not segments and not warnings:
                     warnings.append("No speech detected; clips are ranked by audio loudness only.")
 
+                done_sec = round(duration, 2) if transcription_completed else (
+                    round(segments[-1]["end"], 2) if segments else round(resume_sec, 2)
+                )
                 stage_label = f"Transcript saved ({detected_lang or 'unknown'}, {len(segments)} segments)" if segments else "No speech transcript"
                 await set_job(
                     job_id,
@@ -590,13 +710,13 @@ async def run_pipeline(job_id: str, gemini_api_key: Optional[str] = None, openai
                     telemetry={
                         "detected_language": detected_lang,
                         "detected_language_probability": detected_lang_prob,
-                        "transcribed_seconds": round(duration, 2),
+                        "transcribed_seconds": done_sec,
                         "total_audio_seconds": round(duration, 2),
                         "whisper_model": model_used,
                         "whisper_device": device_label,
                         "realtime_factor": rtf_used,
                         "eta_seconds": 0.0,
-                        "last_transcribed_sec": round(duration, 2),
+                        "last_transcribed_sec": done_sec,
                     },
                 )
             _check(job_id)
@@ -623,9 +743,9 @@ async def run_pipeline(job_id: str, gemini_api_key: Optional[str] = None, openai
                     "whisper_model": model_used,
                     "whisper_device": device_label,
                     "realtime_factor": rtf_used,
-                    "transcribed_seconds": round(duration, 2),
+                    "transcribed_seconds": done_sec,
                     "total_audio_seconds": round(duration, 2),
-                    "last_transcribed_sec": round(duration, 2),
+                    "last_transcribed_sec": done_sec,
                     "can_resume": False,
                 },
             )

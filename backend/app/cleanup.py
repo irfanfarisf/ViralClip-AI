@@ -41,6 +41,12 @@ async def cleanup_storage(min_age_s: float = ORPHAN_MIN_AGE_S) -> dict:
                     part_up.unlink(missing_ok=True)
                     (d / "upload_session.json").unlink(missing_ok=True)
                     removed["partial_files"] += 1
+            for ytdl_part in list(d.glob("*.part*")) + list(d.glob("*.ytdl")):
+                if ytdl_part.name.endswith(".uploading.part"):
+                    continue
+                if _age(ytdl_part) >= min_age_s:
+                    ytdl_part.unlink(missing_ok=True)
+                    removed["partial_files"] += 1
     out = Path(settings.OUTPUT_DIR)
     if out.exists():
         for p in out.rglob("*.part.mp4"):

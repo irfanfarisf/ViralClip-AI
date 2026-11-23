@@ -435,16 +435,18 @@ def build_render_command(
     has_audio: bool,
     fps: int = OUTPUT_FPS,
     audio_bitrate_kbps: int = 160,
+    audio_stream_index: int = 0,
 ) -> List[str]:
     target_fps = min(max(int(fps or OUTPUT_FPS), 15), 60)
     ab_k = min(max(int(audio_bitrate_kbps or 160), 64), 320)
+    a_idx = max(0, int(audio_stream_index or 0))
     cmd = [
         ffmpeg, "-hide_banner", "-y", "-loglevel", "error", "-nostdin",
         "-ss", f"{start:.3f}", "-t", f"{duration:.3f}", "-i", src,
         "-filter_complex", filter_graph, "-map", "[vout]",
     ]
     if has_audio:
-        cmd += ["-map", "0:a:0", "-af", "aresample=48000:async=1:first_pts=0",
+        cmd += ["-map", f"0:a:{a_idx}", "-af", "aresample=48000:async=1:first_pts=0",
                 "-c:a", "aac", "-b:a", f"{ab_k}k", "-ar", "48000", "-ac", "2"]
     else:
         cmd += ["-an"]

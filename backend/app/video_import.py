@@ -12,8 +12,10 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import queue
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -23,7 +25,7 @@ from dataclasses import dataclass, asdict
 from fractions import Fraction
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 from backend.app.config import settings
 from backend.app.gpu_config import find_ffmpeg, find_ffprobe
@@ -40,6 +42,46 @@ TWITCH_HOSTS = {"twitch.tv", "www.twitch.tv", "m.twitch.tv", "clips.twitch.tv"}
 _upload_locks: Dict[str, threading.Lock] = {}
 _session_cache: Dict[str, dict] = {}
 _locks_guard = threading.Lock()
+_active_download_procs: Dict[str, subprocess.Popen] = {}
+_procs_guard = threading.Lock()
+
+
+def _kill_process_tree(proc: subprocess.Popen) -> None:
+    """Terminate a subprocess and all its children (e.g. yt-dlp + child ffmpeg) without leaving orphans."""
+    if proc.poll() is not None:
+        return
+    try:
+        if os.name == "nt":
+            subprocess.run(
+                ["taskkill", "/T", "/F", "/PID", str(proc.pid)],
+                capture_output=True,
+                timeout=10,
+            )
+        else:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
+def terminate_download_process(job_id: str) -> bool:
+    """Immediately terminate any active external download subprocess for `job_id`."""
+    with _procs_guard:
+        proc = _active_download_procs.get(job_id)
+    if proc is not None:
+        _kill_process_tree(proc)
+        return True
+    return False
+
+
+def terminate_all_download_processes() -> None:
+    """Terminate all active download subprocesses (called on backend shutdown)."""
+    with _procs_guard:
+        procs = list(_active_download_procs.values())
+    for proc in procs:
+        _kill_process_tree(proc)
 
 
 def _get_upload_lock(upload_id: str) -> threading.Lock:
@@ -191,7 +233,10 @@ def probe_video(path: Path) -> VideoMetadata:
     )
     if not video:
         raise ImportFailure("The file contains no video stream.")
-    audio = next((s for s in streams if s.get("codec_type") == "audio"), None)
+    audio_streams = [s for s in streams if s.get("codec_type") == "audio"]
+    audio = next((s for s in audio_streams if s.get("disposition", {}).get("default")), None) or (
+        audio_streams[0] if audio_streams else None
+    )
 
     fmt = data.get("format", {})
     try:
@@ -373,15 +418,23 @@ def init_chunked_upload(
         "resumed": False,
     }
     _session_meta_path(vid_id).write_text(json.dumps(session), encoding="utf-8")
+    with _get_upload_lock(vid_id):
+        _session_cache[vid_id] = {**session, "_meta_path": str(_session_meta_path(vid_id))}
     return session
 
 
 def get_upload_session(upload_id: str) -> dict:
     meta_file = _session_meta_path(upload_id)
+    cached = _session_cache.get(upload_id)
+    if cached and cached.get("_meta_path") == str(meta_file) and meta_file.exists():
+        return cached
     if not meta_file.exists():
+        _session_cache.pop(upload_id, None)
         raise ImportFailure("Upload session not found or already finalized.", 404)
     try:
-        return json.loads(meta_file.read_text(encoding="utf-8"))
+        loaded = json.loads(meta_file.read_text(encoding="utf-8"))
+        _session_cache[upload_id] = {**loaded, "_meta_path": str(meta_file)}
+        return _session_cache[upload_id]
     except Exception as exc:
         raise ImportFailure(f"Corrupt upload session state: {exc}", 500)
 
@@ -398,6 +451,18 @@ def write_upload_chunk(
     if should_cancel and should_cancel():
         raise ImportFailure("Upload cancelled by user.", 499)
 
+    chunk_len = len(data)
+    if chunk_len == 0:
+        raise ImportFailure("Chunk payload is empty.", 400)
+
+    # Compute SHA-256 outside the per-upload lock so pipelined chunks hash in parallel
+    actual_sha256 = hashlib.sha256(data).hexdigest()
+    if expected_sha256 and actual_sha256.lower() != expected_sha256.strip().lower():
+        raise ImportFailure(
+            f"Chunk {chunk_index} SHA-256 checksum mismatch (expected {expected_sha256[:12]}..., got {actual_sha256[:12]}...).",
+            422,
+        )
+
     lock = _get_upload_lock(upload_id)
     with lock:
         session = get_upload_session(upload_id)
@@ -410,21 +475,10 @@ def write_upload_chunk(
         if not (0 <= chunk_index < total_chunks):
             raise ImportFailure(f"Invalid chunk_index {chunk_index} (expected 0..{total_chunks - 1}).", 422)
 
-        chunk_len = len(data)
-        if chunk_len == 0:
-            raise ImportFailure("Chunk payload is empty.", 400)
-
         calc_offset = int(offset) if offset is not None else chunk_index * chunk_sz
         if calc_offset < 0 or calc_offset + chunk_len > total_bytes:
             raise ImportFailure(
                 f"Chunk range {calc_offset}..{calc_offset + chunk_len} exceeds total file size ({total_bytes} bytes).",
-                422,
-            )
-
-        actual_sha256 = hashlib.sha256(data).hexdigest()
-        if expected_sha256 and actual_sha256.lower() != expected_sha256.strip().lower():
-            raise ImportFailure(
-                f"Chunk {chunk_index} SHA-256 checksum mismatch (expected {expected_sha256[:12]}..., got {actual_sha256[:12]}...).",
                 422,
             )
 
@@ -461,7 +515,8 @@ def write_upload_chunk(
         session["bytes_received"] = bytes_received
         session["updated_at"] = now
         session["status"] = "UPLOADING"
-        _session_meta_path(upload_id).write_text(json.dumps(session), encoding="utf-8")
+        disk_payload = {k: v for k, v in session.items() if k != "_meta_path"}
+        _session_meta_path(upload_id).write_text(json.dumps(disk_payload), encoding="utf-8")
 
         return {
             "upload_id": upload_id,
@@ -549,13 +604,15 @@ def finalize_chunked_upload(
             meta = probe_video(final_path)
         except BaseException:
             shutil.rmtree(final_path.parent, ignore_errors=True)
+            _session_cache.pop(upload_id, None)
             _upload_locks.pop(upload_id, None)
             raise
 
         # Remove upload session state file now that source.<ext> is finalized and verified
         _session_meta_path(upload_id).unlink(missing_ok=True)
+        _session_cache.pop(upload_id, None)
         _upload_locks.pop(upload_id, None)
-        return final_path, meta, session
+        return final_path, meta, {k: v for k, v in session.items() if k != "_meta_path"}
 
 
 def cancel_chunked_upload(upload_id: str) -> dict:
@@ -576,11 +633,43 @@ def cancel_chunked_upload(upload_id: str) -> dict:
         meta_file.unlink(missing_ok=True)
         if dest_dir.exists() and not any(dest_dir.iterdir()):
             shutil.rmtree(dest_dir, ignore_errors=True)
+        _session_cache.pop(upload_id, None)
         _upload_locks.pop(upload_id, None)
         return {"upload_id": upload_id, "status": "CANCELLED", "job_id": session.get("job_id")}
 
 
 # ---------------------------------------------------------------- external import (YouTube / Twitch)
+
+def normalize_url(url: str) -> str:
+    """Canonicalize supported YouTube/Twitch URLs so equivalent links deduplicate reliably."""
+    raw = (url or "").strip()
+    try:
+        parsed = urlparse(raw)
+    except ValueError:
+        return raw
+    host = (parsed.hostname or "").lower()
+    path = parsed.path or ""
+    if host in YOUTUBE_HOSTS:
+        qs = parse_qs(parsed.query)
+        vid_id = None
+        if host == "youtu.be":
+            vid_id = path.strip("/").split("/")[0] or None
+        elif path.startswith("/watch") and qs.get("v"):
+            vid_id = qs["v"][0]
+        elif path.startswith(("/shorts/", "/live/", "/embed/")):
+            parts = [p for p in path.split("/") if p]
+            if len(parts) >= 2:
+                vid_id = parts[1]
+        if vid_id:
+            return f"youtube:{vid_id}"
+    if host in TWITCH_HOSTS:
+        parts = [p for p in path.split("/") if p]
+        if len(parts) >= 2 and parts[0] == "videos":
+            return f"twitch:video:{parts[1]}"
+        if host == "clips.twitch.tv" and parts:
+            return f"twitch:clip:{parts[0]}"
+    return raw
+
 
 def classify_url(url: str) -> str:
     """Return 'youtube' | 'twitch' or raise ImportFailure."""
@@ -602,9 +691,14 @@ def _ytdlp_command() -> Optional[list]:
     exe = shutil.which("yt-dlp")
     if exe:
         return [exe]
-    import importlib.util
-    if importlib.util.find_spec("yt_dlp") is not None:
+    if sys.modules.get("yt_dlp") is not None:
         return [sys.executable, "-m", "yt_dlp"]
+    import importlib.util
+    try:
+        if importlib.util.find_spec("yt_dlp") is not None:
+            return [sys.executable, "-m", "yt_dlp"]
+    except ValueError:
+        return None
     return None
 
 
@@ -623,6 +717,32 @@ def _parse_opt_float(val: str) -> Optional[float]:
         return None
 
 
+def _cleanup_partial_downloads(dest_dir: Path) -> None:
+    if not dest_dir.exists():
+        return
+    for p in list(dest_dir.glob("*.part*")) + list(dest_dir.glob("*.ytdl")):
+        p.unlink(missing_ok=True)
+
+
+def _select_downloaded_file(dest_dir: Path, expected_path: Optional[Path] = None) -> Optional[Path]:
+    if expected_path and expected_path.exists() and expected_path.suffix.lower() in ALLOWED_EXTENSIONS:
+        return expected_path
+    # Prefer final merged file (exclude intermediate unmerged format streams like source.f137.mp4)
+    cands = [
+        p for p in dest_dir.glob("source.*")
+        if p.suffix.lower() in ALLOWED_EXTENSIONS
+        and not p.name.endswith(".part")
+        and not re.match(r"^source\.f\d+\.", p.name)
+    ]
+    if cands:
+        return max(cands, key=lambda p: p.stat().st_size)
+    fallback = [
+        p for p in dest_dir.glob("source.*")
+        if p.suffix.lower() in ALLOWED_EXTENSIONS and not p.name.endswith(".part")
+    ]
+    return max(fallback, key=lambda p: p.stat().st_size) if fallback else None
+
+
 def import_external(
     url: str,
     dest_dir: Path,
@@ -631,14 +751,15 @@ def import_external(
     should_cancel: Optional[Callable[[], bool]] = None,
     keep_partial_on_error: bool = False,
     concurrent_fragments: Optional[int] = None,
+    job_id: Optional[str] = None,
 ) -> Tuple[Path, VideoMetadata, str, str]:
     """Download a public YouTube/Twitch video the user is authorized to use via yt-dlp.
 
-    - Resolves metadata & stream formats first (advancing out of 2% INITIALIZING immediately).
-    - Streams real progress updates (downloaded_bytes, total_bytes, speed_bps, eta_seconds) via `progress_cb`.
-    - Supports configurable fragment concurrency, socket timeouts, resuming partial downloads (`continuedl`), and retries.
-    - Supports mid-download cancellation via `should_cancel`.
-    - Does NOT transcode video streams (remux/stream-copy only).
+    - Extracts metadata once (single round-trip) and reuses it for download when supported.
+    - Prefers H.264 MP4+M4A (or single-stream progressive MP4 when FFmpeg is absent) with zero video re-encoding.
+    - Configures HTTP chunk sizing, fragment concurrency, retries, and stall/wall-clock timeouts.
+    - Emits monotonic progress (bytes_transferred, total_bytes, speed_bps, eta_seconds) and muxing stage updates.
+    - Supports immediate mid-download/mid-muxing cancellation without leaving orphan subprocesses.
     """
     platform = classify_url(url)
     check_disk_space(0)
@@ -657,7 +778,22 @@ def import_external(
     out_tpl = str(dest_dir / "source.%(ext)s")
     frag_N = max(1, min(int(concurrent_fragments or getattr(settings, "YTDLP_CONCURRENT_FRAGMENTS", 4) or 4), 16))
     sock_timeout = max(5, int(getattr(settings, "YTDLP_SOCKET_TIMEOUT", 20) or 20))
-    fmt_sel = "bv*[ext=mp4][height<=1080]+ba[ext=m4a]/b[ext=mp4][height<=1080]/bv*[height<=1080]+ba/b[height<=1080]/b"
+    http_chunk_mb = max(1, min(int(getattr(settings, "YTDLP_HTTP_CHUNK_SIZE_MB", 10) or 10), 64))
+    http_chunk_bytes = http_chunk_mb * 1024 * 1024
+    retries = max(1, int(getattr(settings, "YTDLP_RETRIES", 5) or 5))
+    frag_retries = max(1, int(getattr(settings, "YTDLP_FRAGMENT_RETRIES", 5) or 5))
+    max_dl_sec = max(60, int(getattr(settings, "YTDLP_MAX_DOWNLOAD_SECONDS", 14400) or 14400))
+    stall_timeout = max(15, int(getattr(settings, "YTDLP_STALL_TIMEOUT_SECONDS", 90) or 90))
+
+    if ff_dir:
+        fmt_sel = (
+            "bv*[ext=mp4][vcodec^=avc1][height<=1080]+ba[ext=m4a]/"
+            "bv*[ext=mp4][height<=1080]+ba[ext=m4a]/"
+            "b[ext=mp4][height<=1080]/"
+            "bv*[height<=1080]+ba/b[height<=1080]/b"
+        )
+    else:
+        fmt_sel = "b[ext=mp4][height<=1080]/b[height<=1080]/b"
 
     if progress_cb:
         progress_cb(ImportProgress(
@@ -667,8 +803,9 @@ def import_external(
         ))
 
     title = f"{platform} video"
+    expected_final: Optional[Path] = None
 
-    # Prefer native Python yt_dlp module for direct progress_hooks and pre-download metadata check
+    # Prefer native Python yt_dlp module for single-pass extract + progress_hooks + postprocessor_hooks
     try:
         import yt_dlp as _ytdlp_mod
         has_py_ytdlp = True
@@ -676,69 +813,132 @@ def import_external(
         has_py_ytdlp = False
 
     if has_py_ytdlp:
-        def _hook(d: dict) -> None:
+        hook_lock = threading.Lock()
+        dl_state = {
+            "stream_idx": 0,
+            "last_filename": None,
+            "high_pct": 5,
+            "total_streams": 1,
+            "last_bytes": 0,
+            "last_activity": time.monotonic(),
+            "started_at": time.monotonic(),
+        }
+
+        def _check_abort() -> None:
             if should_cancel and should_cancel():
                 raise ImportFailure("Download cancelled by user.", 499)
+            now = time.monotonic()
+            if (now - dl_state["started_at"]) > max_dl_sec:
+                raise ImportFailure("Download exceeded maximum allowed duration.", 504)
+            if (now - dl_state["last_activity"]) > stall_timeout:
+                raise ImportFailure("Download stalled (no data received before timeout).", 504)
+
+        def _hook(d: dict) -> None:
+            _check_abort()
             st = d.get("status")
-            if st == "downloading" and progress_cb:
+            fname = d.get("filename") or d.get("tmpfilename")
+            with hook_lock:
                 dl_b = int(d.get("downloaded_bytes") or 0)
-                tot_raw = d.get("total_bytes") or d.get("total_bytes_estimate")
-                tot_int = int(tot_raw) if tot_raw else None
-                spd = float(d.get("speed") or 0.0)
-                eta_raw = d.get("eta")
-                eta_val = round(float(eta_raw), 1) if eta_raw is not None else None
-                if tot_int and tot_int > 0:
-                    pct = min(90, max(5, 5 + int((dl_b / tot_int) * 85)))
+                if dl_b > dl_state["last_bytes"] or st == "finished":
+                    dl_state["last_activity"] = time.monotonic()
+                    dl_state["last_bytes"] = dl_b
+                if fname and fname != dl_state["last_filename"]:
+                    if dl_state["last_filename"] is not None:
+                        dl_state["stream_idx"] += 1
+                    dl_state["last_filename"] = fname
+                    dl_state["last_bytes"] = dl_b
+
+                tot_streams = max(1, dl_state["total_streams"])
+                s_idx = min(dl_state["stream_idx"], tot_streams - 1)
+                # Partition 5..90 monotonically across video (5..78) + audio (78..90) when 2 streams exist
+                if tot_streams >= 2:
+                    band_start, band_end = (5, 78) if s_idx == 0 else (78, 90)
                 else:
+                    band_start, band_end = 5, 90
+
+                if st == "downloading" and progress_cb:
+                    tot_raw = d.get("total_bytes") or d.get("total_bytes_estimate")
+                    tot_int = int(tot_raw) if tot_raw else None
+                    spd = float(d.get("speed") or 0.0)
+                    eta_raw = d.get("eta")
+                    eta_val = round(float(eta_raw), 1) if eta_raw is not None else None
                     frag_idx = int(d.get("fragment_index") or 0)
                     frag_cnt = int(d.get("fragment_count") or 0)
-                    pct = min(90, max(5, 5 + int((frag_idx / frag_cnt) * 85))) if frag_cnt > 0 else 15
+                    if tot_int and tot_int > 0:
+                        frac = min(max(dl_b / tot_int, 0.0), 1.0)
+                    elif frag_cnt > 0:
+                        frac = min(max(frag_idx / frag_cnt, 0.0), 1.0)
+                    else:
+                        frac = 0.25
+                    raw_pct = band_start + int(frac * (band_end - band_start))
+                    pct = max(dl_state["high_pct"], min(band_end, raw_pct))
+                    dl_state["high_pct"] = pct
+                    stream_lbl = "audio stream" if (tot_streams >= 2 and s_idx > 0) else "video stream"
+                    progress_cb(ImportProgress(
+                        stage="DOWNLOADING",
+                        progress=pct,
+                        bytes_transferred=dl_b,
+                        total_bytes=tot_int,
+                        speed_bps=round(spd, 1),
+                        eta_seconds=eta_val,
+                        chunks_received=frag_idx,
+                        total_chunks=frag_cnt,
+                        message=f"Downloading {stream_lbl} for '{title}' from {platform.title()}",
+                    ))
+                elif st == "finished" and progress_cb:
+                    pct = max(dl_state["high_pct"], band_end)
+                    dl_state["high_pct"] = pct
+                    dl_b_fin = int(d.get("downloaded_bytes") or d.get("total_bytes") or 0)
+                    progress_cb(ImportProgress(
+                        stage="DOWNLOADING",
+                        progress=pct,
+                        bytes_transferred=dl_b_fin,
+                        total_bytes=dl_b_fin or None,
+                        speed_bps=0.0,
+                        eta_seconds=0.0 if pct >= 90 else None,
+                        message="Stream downloaded; preparing container..." if pct >= 90 else "Video stream complete; downloading audio...",
+                    ))
+
+        def _pp_hook(d: dict) -> None:
+            if should_cancel and should_cancel():
+                raise ImportFailure("Download cancelled by user.", 499)
+            if d.get("status") == "started" and progress_cb:
                 progress_cb(ImportProgress(
-                    stage="DOWNLOADING",
-                    progress=pct,
-                    bytes_transferred=dl_b,
-                    total_bytes=tot_int,
-                    speed_bps=round(spd, 1),
-                    eta_seconds=eta_val,
-                    chunks_received=int(d.get("fragment_index") or 0),
-                    total_chunks=int(d.get("fragment_count") or 0),
-                    message=f"Downloading '{title}' from {platform.title()}",
-                ))
-            elif st == "finished" and progress_cb:
-                dl_b = int(d.get("downloaded_bytes") or d.get("total_bytes") or 0)
-                progress_cb(ImportProgress(
-                    stage="DOWNLOADING",
-                    progress=90,
-                    bytes_transferred=dl_b,
-                    total_bytes=dl_b or None,
-                    speed_bps=0.0,
-                    eta_seconds=0.0,
-                    message="Stream download complete; muxing container...",
+                    stage="VALIDATING",
+                    progress=91,
+                    message="Muxing audio & video streams (stream copy, no re-encoding)...",
                 ))
 
         ydl_opts: Dict[str, Any] = {
             "format": fmt_sel,
-            "merge_output_format": "mp4",
+            "merge_output_format": "mp4" if ff_dir else None,
             "outtmpl": out_tpl,
             "noplaylist": True,
             "continuedl": True,
             "nopart": False,
-            "retries": 5,
-            "fragment_retries": 5,
+            "retries": retries,
+            "fragment_retries": frag_retries,
+            "extractor_retries": 3,
+            "file_access_retries": 5,
             "concurrent_fragment_downloads": frag_N,
+            "http_chunk_size": http_chunk_bytes,
+            "buffersize": 65536,
             "socket_timeout": sock_timeout,
             "quiet": True,
             "no_warnings": True,
             "progress_hooks": [_hook],
+            "postprocessor_hooks": [_pp_hook],
         }
-        if ff_dir:
+        if not ff_dir:
+            ydl_opts.pop("merge_output_format", None)
+        else:
             ydl_opts["ffmpeg_location"] = ff_dir
 
         try:
             with _ytdlp_mod.YoutubeDL(ydl_opts) as ydl:
                 if should_cancel and should_cancel():
                     raise ImportFailure("Download cancelled by user.", 499)
-                info = ydl.extract_info(url, download=False)
+                info = ydl.extract_info(url, download=False, process=True)
                 if not info:
                     raise ImportFailure("Could not resolve video metadata from URL.", 422)
                 title = str(info.get("title") or title)
@@ -746,9 +946,16 @@ def import_external(
                 max_s = settings.MAX_VIDEO_DURATION_HOURS * 3600
                 if dur_est > max_s:
                     raise ImportFailure(f"Video duration ({dur_est / 3600:.1f}h) exceeds the {settings.MAX_VIDEO_DURATION_HOURS}h limit.", 422)
-                size_est = int(info.get("filesize") or info.get("filesize_approx") or 0)
+
+                req_fmts = info.get("requested_formats") or []
+                if req_fmts:
+                    dl_state["total_streams"] = len(req_fmts)
+                    size_est = sum(int(f.get("filesize") or f.get("filesize_approx") or 0) for f in req_fmts)
+                else:
+                    size_est = int(info.get("filesize") or info.get("filesize_approx") or 0)
                 if size_est > 0:
                     check_disk_space(size_est)
+
                 if progress_cb:
                     progress_cb(ImportProgress(
                         stage="DOWNLOADING",
@@ -757,9 +964,26 @@ def import_external(
                         total_bytes=size_est or None,
                         message=f"Metadata verified ('{title}') — starting stream download",
                     ))
-                ydl.download([url])
-        except ImportFailure:
-            if not keep_partial_on_error:
+                dl_state["last_activity"] = time.monotonic()
+
+                # Single-pass download reusing `info` (eliminates duplicate extract_info round-trip)
+                if info.get("requested_formats") or info.get("url") or info.get("formats"):
+                    res_info = ydl.process_ie_result(info, download=True)
+                else:
+                    res_info = ydl.extract_info(url, download=True)
+
+                if isinstance(res_info, dict):
+                    req_dl = res_info.get("requested_downloads") or []
+                    if req_dl and isinstance(req_dl[0], dict) and req_dl[0].get("filepath"):
+                        expected_final = Path(req_dl[0]["filepath"])
+                    elif res_info.get("_filename"):
+                        expected_final = Path(res_info["_filename"])
+        except ImportFailure as exc:
+            if exc.status == 499:
+                _cleanup_partial_downloads(dest_dir)
+                if not any(dest_dir.iterdir()) if dest_dir.exists() else False:
+                    shutil.rmtree(dest_dir, ignore_errors=True)
+            elif not keep_partial_on_error:
                 shutil.rmtree(dest_dir, ignore_errors=True)
             raise
         except Exception as exc:
@@ -773,6 +997,7 @@ def import_external(
     else:
         # Subprocess fallback when yt-dlp is installed only as an external binary
         ffmpeg_hint = ["--ffmpeg-location", ff_dir] if ff_dir else []
+        merge_args = ["--merge-output-format", "mp4"] if ff_dir else []
         args = [
             *cmd,
             "--no-playlist",
@@ -780,47 +1005,82 @@ def import_external(
             "--no-warnings",
             "--continue",
             "--socket-timeout", str(sock_timeout),
-            "--retries", "5",
-            "--fragment-retries", "5",
+            "--retries", str(retries),
+            "--fragment-retries", str(frag_retries),
+            "--extractor-retries", "3",
+            "--file-access-retries", "5",
             "--concurrent-fragments", str(frag_N),
+            "--http-chunk-size", f"{http_chunk_mb}M",
+            "--buffer-size", "65536",
             "--newline",
             "--progress-template",
             "download:VC_PROG|%(progress.downloaded_bytes)s|%(progress.total_bytes)s|%(progress.total_bytes_estimate)s|%(progress.speed)s|%(progress.eta)s",
             "-f", fmt_sel,
-            "--merge-output-format", "mp4",
+            *merge_args,
             "--print", "before_dl:VC_INIT:%(title)s|%(filesize,filesize_approx)s",
-            "--print", "after_move:VC_TITLE:%(title)s",
+            "--print", "after_move:VC_FILEPATH:%(filepath)s",
             "-o", out_tpl,
             *ffmpeg_hint,
             url,
         ]
-        proc = subprocess.Popen(
-            args,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-        )
+        popen_kwargs: Dict[str, Any] = {
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.STDOUT,
+            "text": True,
+            "encoding": "utf-8",
+            "errors": "replace",
+        }
+        if os.name == "nt":
+            popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            popen_kwargs["start_new_session"] = True
+
+        proc = subprocess.Popen(args, **popen_kwargs)
+        if job_id:
+            with _procs_guard:
+                _active_download_procs[job_id] = proc
+
+        line_q: "queue.Queue[Optional[str]]" = queue.Queue()
+
+        def _reader() -> None:
+            try:
+                assert proc.stdout is not None
+                for ln in proc.stdout:
+                    line_q.put(ln)
+            finally:
+                line_q.put(None)
+
+        threading.Thread(target=_reader, daemon=True).start()
+
         last_lines: List[str] = []
-        start_ts = time.time()
+        start_ts = time.monotonic()
+        last_activity = start_ts
+        high_pct = 5
         try:
-            assert proc.stdout is not None
-            for raw_line in proc.stdout:
+            while True:
                 if should_cancel and should_cancel():
-                    proc.terminate()
-                    try:
-                        proc.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        proc.kill()
-                    if not keep_partial_on_error:
-                        for p in dest_dir.glob("*.part*"):
-                            p.unlink(missing_ok=True)
+                    _kill_process_tree(proc)
+                    _cleanup_partial_downloads(dest_dir)
                     raise ImportFailure("Download cancelled by user.", 499)
 
-                if time.time() - start_ts > 14400:
-                    proc.kill()
+                now = time.monotonic()
+                if now - start_ts > max_dl_sec:
+                    _kill_process_tree(proc)
                     raise ImportFailure("Download timed out.", 504)
+                if now - last_activity > stall_timeout:
+                    _kill_process_tree(proc)
+                    raise ImportFailure("Download stalled (no progress before timeout).", 504)
+
+                try:
+                    raw_line = line_q.get(timeout=0.4)
+                except queue.Empty:
+                    if proc.poll() is not None and line_q.empty():
+                        break
+                    continue
+
+                if raw_line is None:
+                    break
+                last_activity = time.monotonic()
 
                 line = raw_line.strip()
                 if not line:
@@ -838,8 +1098,10 @@ def import_external(
                             message=f"Metadata verified ('{title}') — starting stream download",
                         ))
                     continue
-                if line.startswith("VC_TITLE:"):
-                    title = line[len("VC_TITLE:"):].strip() or title
+                if line.startswith("VC_FILEPATH:"):
+                    fp = line[len("VC_FILEPATH:"):].strip()
+                    if fp:
+                        expected_final = Path(fp)
                     continue
 
                 m = _PROGRESS_RE.search(line)
@@ -849,11 +1111,12 @@ def import_external(
                     tot_int = int(tot_b) if tot_b else None
                     spd = _parse_opt_float(m.group(4)) or 0.0
                     eta = _parse_opt_float(m.group(5))
-                    pct = min(90, max(5, 5 + int((dl_b / tot_int) * 85))) if tot_int and tot_int > 0 else 25
+                    raw_pct = min(90, max(5, 5 + int((dl_b / tot_int) * 85))) if tot_int and tot_int > 0 else 25
+                    high_pct = max(high_pct, raw_pct)
                     progress_cb(
                         ImportProgress(
                             stage="DOWNLOADING",
-                            progress=pct,
+                            progress=high_pct,
                             bytes_transferred=dl_b,
                             total_bytes=tot_int,
                             speed_bps=round(spd, 1),
@@ -869,10 +1132,14 @@ def import_external(
         except ImportFailure:
             raise
         except Exception as exc:
-            proc.kill()
+            _kill_process_tree(proc)
             if not keep_partial_on_error:
                 shutil.rmtree(dest_dir, ignore_errors=True)
             raise ImportFailure(f"Download interrupted: {exc}", 502)
+        finally:
+            if job_id:
+                with _procs_guard:
+                    _active_download_procs.pop(job_id, None)
 
         if proc.returncode != 0:
             if not keep_partial_on_error:
@@ -886,11 +1153,8 @@ def import_external(
     if progress_cb:
         progress_cb(ImportProgress(stage="VALIDATING", progress=92, message="Validating downloaded video file"))
 
-    files = [
-        p for p in dest_dir.glob("source.*")
-        if p.suffix.lower() in ALLOWED_EXTENSIONS and not p.name.endswith(".part")
-    ]
-    if not files:
+    chosen_file = _select_downloaded_file(dest_dir, expected_final)
+    if not chosen_file:
         if not keep_partial_on_error:
             shutil.rmtree(dest_dir, ignore_errors=True)
         raise ImportFailure("Download finished but no valid video file was produced.", 502)
@@ -899,10 +1163,10 @@ def import_external(
         progress_cb(ImportProgress(stage="EXTRACTING_METADATA", progress=96, message="Extracting metadata with FFprobe"))
 
     try:
-        meta = probe_video(files[0])
+        meta = probe_video(chosen_file)
     except BaseException:
         if not keep_partial_on_error:
             shutil.rmtree(dest_dir, ignore_errors=True)
         raise
 
-    return files[0], meta, platform, safe_display_name(title)
+    return chosen_file, meta, platform, safe_display_name(title)

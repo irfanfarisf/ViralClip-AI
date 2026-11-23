@@ -18,6 +18,7 @@ from backend.app.schemas.clip import ClipMetadataRequest, ClipTranscriptUpdate, 
 from backend.app.schemas.pipeline import AnalyzeRequest, BatchExportRequest, ExportRequest, GenerateClipsRequest
 
 router = APIRouter(tags=["Pipeline"])
+_active_clip_translations: set[str] = set()
 
 
 @router.post("/upload", status_code=201)
@@ -234,68 +235,121 @@ async def translate_clip_subtitles(
     # If resetting to original
     if target_lang in ("original", "source", "none", ""):
         st = dict(clip.subtitle_style or {})
-        st.pop("translated_words", None)
-        st["subtitle_language"] = source_lang or "original"
+        for k in (
+            "translated_words",
+            "translatedWords",
+            "translated_segments",
+            "translatedSegments",
+            "translation_provider",
+            "translationProvider",
+            "translation_partial",
+            "translation_warnings",
+        ):
+            st.pop(k, None)
+        st["is_translated"] = False
+        st["isTranslated"] = False
+        st["subtitle_language"] = "original"
+        st["subtitleLanguage"] = "original"
         clip.subtitle_style = st
         await db.commit()
         await db.refresh(clip)
         return {
             "clip_id": clip.id,
+            "source_language": source_lang or "auto",
             "target_language": "original",
+            "provider": "original",
+            "partial": False,
+            "warnings": [],
+            "translated_segments": [],
             "translated_words": [],
             "subtitle_style": clip.subtitle_style,
         }
 
-    # Fetch original segments for this clip
-    segs = (await db.execute(
-        select(TranscriptSegment)
-        .where(
-            TranscriptSegment.video_id == job.video_id,
-            TranscriptSegment.end_time >= clip.start_time,
-            TranscriptSegment.start_time <= clip.end_time,
-        )
-        .order_by(TranscriptSegment.start_time)
-    )).scalars().all()
+    # Prevent duplicate concurrent translation requests for the same clip
+    if clip_id in _active_clip_translations:
+        raise HTTPException(status_code=409, detail="Subtitle translation is already in progress for this clip.")
+    _active_clip_translations.add(clip_id)
 
-    seg_dicts = [
-        {"start": s.start_time, "end": s.end_time, "text": s.text, "words": s.words}
-        for s in segs
-    ]
+    try:
+        # Fetch original segments for this clip (read-only; original transcript is never modified)
+        segs = (await db.execute(
+            select(TranscriptSegment)
+            .where(
+                TranscriptSegment.video_id == job.video_id,
+                TranscriptSegment.end_time >= clip.start_time,
+                TranscriptSegment.start_time <= clip.end_time,
+            )
+            .order_by(TranscriptSegment.start_time)
+        )).scalars().all()
 
-    job_opts = dict(job.settings or {})
-    gkey = req.gemini_api_key or job_opts.get("gemini_api_key")
-    okey = req.openai_api_key or job_opts.get("openai_api_key")
+        seg_dicts = [
+            {
+                "id": s.id,
+                "start": s.start_time,
+                "end": s.end_time,
+                "text": s.text,
+                "confidence": s.confidence,
+                "words": s.words,
+            }
+            for s in segs
+        ]
 
-    trans_segs, trans_words = await asyncio.to_thread(
-        translation.translate_subtitle_segments,
-        seg_dicts,
-        target_lang,
-        source_lang,
-        gemini_api_key=gkey,
-        openai_api_key=okey,
-    )
+        job_opts = dict(job.settings or {})
+        gkey = req.gemini_api_key or job_opts.get("gemini_api_key")
+        okey = req.openai_api_key or job_opts.get("openai_api_key")
 
-    # Update clip subtitle style with translated words & optimal Unicode font
-    st = dict(clip.subtitle_style or {})
-    st["subtitle_language"] = target_lang
-    st["translated_words"] = trans_words
+        try:
+            result = await asyncio.to_thread(
+                translation.translate_clip_segments,
+                seg_dicts,
+                target_lang,
+                source_lang,
+                gemini_api_key=gkey,
+                openai_api_key=okey,
+            )
+        except translation.TranslationError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=exc.message)
 
-    # Auto-resolve font for the target script if currently Arial/Impact
-    sample_text = " ".join(w["word"] for w in trans_words[:10]) if trans_words else ""
-    st["font"] = translation.resolve_font_for_script(sample_text, st.get("font", "Arial"))
-    st["fontFamily"] = st["font"]
+        # Store translated subtitles separately inside clip.subtitle_style (original TranscriptSegment rows untouched)
+        st = dict(clip.subtitle_style or {})
+        st.pop("translatedWords", None)
+        st.pop("translatedSegments", None)
+        st["subtitle_language"] = result.target_language
+        st["subtitleLanguage"] = result.target_language
+        st["source_language"] = result.source_language
+        st["is_translated"] = True
+        st["isTranslated"] = True
+        st["translated_segments"] = result.segments
+        st["translated_words"] = result.words
+        st["translation_provider"] = result.provider
+        st["translation_partial"] = result.partial
+        st["translation_warnings"] = result.warnings
 
-    clip.subtitle_style = st
-    await db.commit()
-    await db.refresh(clip)
+        sample_text = " ".join(w["word"] for w in result.words[:10]) if result.words else ""
+        resolved_font = translation.resolve_font_for_script(sample_text, st.get("font") or st.get("fontFamily") or "Arial")
+        st["font"] = resolved_font
+        st["fontFamily"] = resolved_font
+        if translation.detect_script(sample_text) != "latin":
+            st["uppercase"] = False
+            st["isUppercase"] = False
 
-    return {
-        "clip_id": clip.id,
-        "target_language": target_lang,
-        "translated_segments": trans_segs,
-        "translated_words": trans_words,
-        "subtitle_style": clip.subtitle_style,
-    }
+        clip.subtitle_style = st
+        await db.commit()
+        await db.refresh(clip)
+
+        return {
+            "clip_id": clip.id,
+            "source_language": result.source_language,
+            "target_language": result.target_language,
+            "provider": result.provider,
+            "partial": result.partial,
+            "warnings": result.warnings,
+            "translated_segments": result.segments,
+            "translated_words": result.words,
+            "subtitle_style": clip.subtitle_style,
+        }
+    finally:
+        _active_clip_translations.discard(clip_id)
 
 
 @router.post("/clips/{clip_id}/smart-crop")

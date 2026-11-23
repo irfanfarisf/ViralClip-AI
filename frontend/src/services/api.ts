@@ -8,6 +8,16 @@ export interface BackendHealthResponse {
   ffprobe: boolean;
   gpuEncoder: string | null;
   whisper: boolean;
+  whisperHardware?: {
+    device?: string;
+    compute_type?: string;
+    cpu_threads?: number;
+    gpu_accelerated?: boolean;
+    cpu_name?: string;
+    amd_gpu?: string | null;
+    backend_note?: string;
+    label?: string;
+  } | null;
   pythonVersion: string;
 }
 
@@ -22,6 +32,7 @@ export const checkBackendHealth = async (): Promise<BackendHealthResponse> => {
         ffprobe: Boolean(data.ffprobe),
         gpuEncoder: data.gpu_encoder ?? null,
         whisper: Boolean(data.whisper),
+        whisperHardware: data.whisper_hardware ?? null,
         pythonVersion: data.python_version || '3.12+',
       };
     }
@@ -34,11 +45,13 @@ export const checkBackendHealth = async (): Promise<BackendHealthResponse> => {
     ffprobe: false,
     gpuEncoder: null,
     whisper: false,
+    whisperHardware: null,
     pythonVersion: 'Unknown',
   };
 };
 
 const CHUNK_SIZE_BYTES = 16 * 1024 * 1024; // 16 MB default configurable slice for 1-3+ hour videos
+const CONCURRENT_UPLOAD_WORKERS = 2; // Pipelined 2-worker upload (<= 32 MB in-flight browser slice memory)
 
 export const cancelUploadSession = async (uploadId: string): Promise<void> => {
   try {
@@ -54,6 +67,7 @@ export const uploadVideoFile = async (
   options?: {
     language?: string;
     whisperModel?: string;
+    transcriptionProfile?: string;
     geminiApiKey?: string;
     openaiApiKey?: string;
     autoAnalyze?: boolean;
@@ -97,6 +111,7 @@ export const uploadVideoFile = async (
       auto_analyze: options?.autoAnalyze ?? true,
       language: options?.language || undefined,
       whisper_model: options?.whisperModel || undefined,
+      transcription_profile: options?.transcriptionProfile || undefined,
       gemini_api_key: options?.geminiApiKey || undefined,
       openai_api_key: options?.openaiApiKey || undefined,
     }),
@@ -134,57 +149,88 @@ export const uploadVideoFile = async (
     });
   }
 
-  // 2. Stream missing chunks sequentially (constant 8 MB memory footprint)
+  // 2. Stream missing chunks with 2 pipelined workers (<= 32 MB browser memory footprint)
+  const pendingIndices: number[] = [];
   for (let idx = 0; idx < totalChunks; idx++) {
-    if (options?.signal?.aborted) {
-      await cancelUploadSession(uploadId);
-      throw new Error('Upload cancelled by user');
+    if (!receivedSet.has(idx)) {
+      pendingIndices.push(idx);
     }
-    if (receivedSet.has(idx)) {
-      continue; // Skip already verified chunks on resume
-    }
+  }
 
-    const start = idx * chunkSize;
-    const end = Math.min(start + chunkSize, file.size);
-    const slice = file.slice(start, end);
+  let cursor = 0;
+  let highWaterBytes = Number(session.bytes_received || 0);
+  let highWaterPct = Math.round((highWaterBytes / Math.max(file.size, 1)) * 95);
+  let abortTriggered = false;
 
-    const chunkRes = await fetch(
-      `${API_BASE}/videos/upload/${uploadId}/chunk?chunk_index=${idx}&offset=${start}`,
-      {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/octet-stream' },
-        body: slice,
-        signal: options?.signal,
+  const uploadWorker = async () => {
+    while (cursor < pendingIndices.length) {
+      if (options?.signal?.aborted) {
+        if (!abortTriggered) {
+          abortTriggered = true;
+          await cancelUploadSession(uploadId);
+        }
+        throw new Error('Upload cancelled by user');
       }
-    );
+      const idx = pendingIndices[cursor++];
+      if (idx === undefined) break;
 
-    if (!chunkRes.ok) {
-      let errMsg = `Chunk #${idx} failed (HTTP ${chunkRes.status})`;
-      try {
-        const errData = await chunkRes.json();
-        errMsg = errData.detail || errMsg;
-      } catch {
-        // ignore
+      const start = idx * chunkSize;
+      const end = Math.min(start + chunkSize, file.size);
+      const slice = file.slice(start, end);
+
+      const chunkRes = await fetch(
+        `${API_BASE}/videos/upload/${uploadId}/chunk?chunk_index=${idx}&offset=${start}`,
+        {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/octet-stream' },
+          body: slice,
+          signal: options?.signal,
+        }
+      );
+
+      if (!chunkRes.ok) {
+        let errMsg = `Chunk #${idx} failed (HTTP ${chunkRes.status})`;
+        try {
+          const errData = await chunkRes.json();
+          errMsg = errData.detail || errMsg;
+        } catch {
+          // ignore
+        }
+        throw new Error(errMsg);
       }
-      throw new Error(errMsg);
-    }
 
-    const cData = await chunkRes.json();
-    const pct = Number(cData.progress ?? Math.round((end / Math.max(file.size, 1)) * 95));
-    if (onProgress) onProgress(pct);
-    if (options?.onTelemetry) {
-      options.onTelemetry({
-        stage: cData.stage || 'UPLOADING',
-        progress: pct,
-        bytesTransferred: cData.bytes_received ?? end,
-        totalBytes: cData.total_bytes ?? file.size,
-        speedBps: cData.speed_bps ?? 0,
-        etaSeconds: cData.eta_seconds ?? null,
-        chunksReceived: cData.chunks_received ?? idx + 1,
-        totalChunks,
-        resumed: Boolean(session.resumed),
-        uploadId,
-      });
+      const cData = await chunkRes.json();
+      highWaterBytes = Math.max(highWaterBytes, Number(cData.bytes_received ?? end));
+      const pct = Math.max(highWaterPct, Number(cData.progress ?? Math.round((highWaterBytes / Math.max(file.size, 1)) * 95)));
+      highWaterPct = pct;
+      if (onProgress) onProgress(pct);
+      if (options?.onTelemetry) {
+        options.onTelemetry({
+          stage: cData.stage || 'UPLOADING',
+          progress: pct,
+          bytesTransferred: highWaterBytes,
+          totalBytes: cData.total_bytes ?? file.size,
+          speedBps: cData.speed_bps ?? 0,
+          etaSeconds: cData.eta_seconds ?? null,
+          chunksReceived: cData.chunks_received ?? idx + 1,
+          totalChunks,
+          resumed: Boolean(session.resumed),
+          uploadId,
+        });
+      }
+    }
+  };
+
+  if (pendingIndices.length > 0) {
+    const workerCount = Math.min(CONCURRENT_UPLOAD_WORKERS, pendingIndices.length);
+    try {
+      await Promise.all(Array.from({ length: workerCount }, () => uploadWorker()));
+    } catch (err) {
+      if (options?.signal?.aborted && !abortTriggered) {
+        abortTriggered = true;
+        await cancelUploadSession(uploadId);
+      }
+      throw err;
     }
   }
 
@@ -253,7 +299,14 @@ export const uploadVideoFile = async (
 export const importFromUrl = async (
   url: string,
   platform: 'youtube' | 'twitch',
-  options?: { language?: string; whisperModel?: string; geminiApiKey?: string; openaiApiKey?: string; autoAnalyze?: boolean }
+  options?: {
+    language?: string;
+    whisperModel?: string;
+    transcriptionProfile?: string;
+    geminiApiKey?: string;
+    openaiApiKey?: string;
+    autoAnalyze?: boolean;
+  }
 ): Promise<{
   id: string;
   jobId: string;
@@ -276,6 +329,7 @@ export const importFromUrl = async (
       auto_analyze: options?.autoAnalyze ?? true,
       language: options?.language || undefined,
       whisper_model: options?.whisperModel || undefined,
+      transcription_profile: options?.transcriptionProfile || undefined,
       gemini_api_key: options?.geminiApiKey || undefined,
       openai_api_key: options?.openaiApiKey || undefined,
     }),
@@ -413,7 +467,11 @@ export const translateClipSubtitles = async (
   options?: { geminiApiKey?: string; openaiApiKey?: string }
 ): Promise<{
   clip_id: string;
+  source_language?: string;
   target_language: string;
+  provider?: string;
+  partial?: boolean;
+  warnings?: string[];
   translated_segments?: any[];
   translated_words: any[];
   subtitle_style: any;
@@ -478,6 +536,7 @@ export const exportClipOnBackend = async (
     facecam_crop?: any;
     gameplay_crop?: any;
     subtitle_style?: any;
+    burn_subtitles?: boolean;
     prefer_hardware?: boolean;
     fps?: number;
     bitrate_kbps?: number;
@@ -566,10 +625,12 @@ export const connectJobWebSocket = (
     total_bytes?: number | null;
     speed_bps?: number;
     eta_seconds?: number | null;
+    elapsed_seconds?: number;
     can_resume?: boolean;
     transcribed_seconds?: number;
     total_audio_seconds?: number;
     whisper_model?: string;
+    whisper_profile?: string;
     whisper_device?: string;
     realtime_factor?: number;
     detected_language?: string;

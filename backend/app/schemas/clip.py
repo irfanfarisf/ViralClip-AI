@@ -54,6 +54,7 @@ class ClipExportRequest(BaseModel):
     facecam_crop: Optional[Dict[str, Any]] = None
     gameplay_crop: Optional[Dict[str, Any]] = None
     subtitle_style: Optional[Dict[str, Any]] = None
+    burn_subtitles: Optional[bool] = True
     prefer_hardware: Optional[bool] = True
     fps: Optional[int] = 30
     bitrate_kbps: Optional[int] = None

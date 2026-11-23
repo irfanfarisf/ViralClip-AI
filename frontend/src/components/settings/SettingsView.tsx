@@ -137,12 +137,15 @@ export const SettingsView: React.FC = () => {
               }
               className="w-full px-3 py-2.5 rounded-xl bg-[#0b0c10] border border-[#23283b] text-xs font-semibold text-white focus:outline-none focus:border-purple-500"
             >
-              <option value="tiny">Tiny (~75 MB - Ultra Fast)</option>
-              <option value="base">Base (~145 MB - Recommended Default)</option>
-              <option value="small">Small (~480 MB - Higher Accuracy)</option>
-              <option value="medium">Medium (~1.5 GB - Best Accuracy)</option>
+              <option value="tiny">Tiny (~75 MB - Ultra Fast, English)</option>
+              <option value="base">Base (~145 MB - Fast Default, English)</option>
+              <option value="small">Small (~480 MB - Recommended for Multilingual)</option>
+              <option value="medium">Medium (~1.5 GB - High Multilingual Accuracy)</option>
+              <option value="large-v3">Large-v3 (~3.0 GB - Best Non-English Accuracy)</option>
             </select>
-            <p className="text-[11px] text-slate-400 mt-1">Runs completely offline on your computer.</p>
+            <p className="text-[11px] text-slate-400 mt-1">
+              Use Small, Medium, or Large-v3 for Malayalam, Hindi, Tamil, Arabic, and non-Latin scripts.
+            </p>
           </div>
 
           <div>
@@ -162,7 +165,56 @@ export const SettingsView: React.FC = () => {
               <option value="cpu">CPU (Universal Fallback)</option>
               <option value="cuda">CUDA (NVIDIA Hardware Acceleration)</option>
             </select>
-            <p className="text-[11px] text-slate-400 mt-1">Uses CPU int8 quantization by default.</p>
+            <p className="text-[11px] text-slate-400 mt-1">
+              {backendStatus.whisperHardware?.backend_note || 'Uses CPU int8 quantization by default.'}
+            </p>
+          </div>
+        </div>
+
+        <div className="space-y-2 pt-2 border-t border-[#1c2030]">
+          <label className="block text-xs font-semibold text-slate-300">
+            Transcription Performance Profile
+          </label>
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
+            {([
+              {
+                id: 'speed',
+                label: 'Speed',
+                desc: 'Batched beam=1, best_of=1. Fastest on long videos; slight accuracy trade-off on noisy/non-English audio.',
+              },
+              {
+                id: 'balanced',
+                label: 'Balanced (Default)',
+                desc: 'Batched beam=1 for English; unbatched beam=2 for non-English to protect multilingual quality.',
+              },
+              {
+                id: 'accuracy',
+                label: 'Accuracy',
+                desc: 'Unbatched beam=3, best_of=2 with multi-temperature fallback. Best fidelity, slowest runtime.',
+              },
+            ] as const).map((prof) => {
+              const active = (settings.transcriptionProfile || 'balanced') === prof.id;
+              return (
+                <button
+                  key={prof.id}
+                  type="button"
+                  onClick={() =>
+                    setSettings((prev) => ({
+                      ...prev,
+                      transcriptionProfile: prof.id,
+                    }))
+                  }
+                  className={`p-3 rounded-xl border text-left transition-all ${
+                    active
+                      ? 'bg-purple-600/15 border-purple-500 text-white'
+                      : 'bg-[#0b0c10] border-[#23283b] text-slate-300 hover:border-slate-600'
+                  }`}
+                >
+                  <div className="text-xs font-bold">{prof.label}</div>
+                  <div className="text-[10px] text-slate-400 mt-1 leading-relaxed">{prof.desc}</div>
+                </button>
+              );
+            })}
           </div>
         </div>
 

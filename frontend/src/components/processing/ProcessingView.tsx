@@ -39,21 +39,26 @@ export const ProcessingView: React.FC = () => {
   const [isRefreshing, setIsRefreshing] = useState(false);
   const videoRef = useRef<HTMLVideoElement>(null);
 
+  const lowStatus = String(activeProject?.status || '').toLowerCase();
   const isJobRunning = Boolean(
     activeProject?.activeJobId &&
       [
         'queued',
+        'initializing',
+        'downloading',
+        'uploading',
+        'validating',
+        'extracting_metadata',
         'analyzing',
         'transcribing',
         'detecting',
-        'uploading',
-        'QUEUED',
-        'INITIALIZING',
-        'DOWNLOADING',
-        'UPLOADING',
-        'VALIDATING',
-        'EXTRACTING_METADATA',
-      ].includes(activeProject.status)
+      ].includes(lowStatus)
+  );
+  const isMediaReady = Boolean(
+    activeProject?.localVideoUrl &&
+      !['queued', 'initializing', 'downloading', 'uploading', 'validating', 'extracting_metadata', 'failed', 'cancelled'].includes(
+        lowStatus
+      )
   );
 
   // Poll job status if in progress
@@ -202,14 +207,14 @@ export const ProcessingView: React.FC = () => {
               </button>
             )}
 
-            {(['cancelled', 'CANCELLED', 'failed', 'FAILED', 'COMPLETED'].includes(activeProject.status)) && activeProject.activeJobId && (
+            {(['cancelled', 'failed', 'completed'].includes(lowStatus)) && activeProject.activeJobId && (
               <button
                 onClick={handleRestartJob}
                 className="flex items-center gap-1.5 px-3.5 py-2.5 rounded-xl bg-purple-600 hover:bg-purple-500 text-white text-xs font-semibold transition-colors"
               >
                 <RefreshCw className="w-4 h-4" />
                 <span>
-                  {activeProject.status === 'COMPLETED'
+                  {lowStatus === 'completed'
                     ? 'Start AI Analysis'
                     : activeProject.canResume
                     ? 'Resume / Retry'
@@ -276,8 +281,9 @@ export const ProcessingView: React.FC = () => {
                 </span>
               </div>
               <div>
-                <span className="text-slate-500 block">ETA</span>
+                <span className="text-slate-500 block">Elapsed / ETA</span>
                 <span className="text-cyan-300">
+                  {activeProject.elapsedSeconds !== undefined ? `${Math.round(activeProject.elapsedSeconds)}s / ` : ''}
                   {activeProject.etaSeconds !== null && activeProject.etaSeconds !== undefined
                     ? `${Math.ceil(activeProject.etaSeconds)}s`
                     : '--'}
@@ -289,9 +295,9 @@ export const ProcessingView: React.FC = () => {
           {(activeProject.status === 'transcribing' || activeProject.transcribedSeconds || activeProject.whisperDevice) ? (
             <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 p-3 rounded-xl bg-[#0e1017] border border-[#1f2437] text-[11px] font-mono text-slate-300">
               <div>
-                <span className="text-slate-500 block">Whisper Device & Model</span>
+                <span className="text-slate-500 block">Whisper Device &amp; Profile</span>
                 <span className="text-purple-300 font-bold">
-                  {(activeProject.whisperModel || 'base').toUpperCase()} • {activeProject.whisperDevice || 'CPU (int8)'}
+                  {(activeProject.whisperModel || 'base').toUpperCase()} • {(activeProject.whisperProfile || 'balanced').toUpperCase()} • {activeProject.whisperDevice || 'CPU (int8)'}
                 </span>
               </div>
               <div>
@@ -309,11 +315,12 @@ export const ProcessingView: React.FC = () => {
                 </span>
               </div>
               <div>
-                <span className="text-slate-500 block">Estimated Remaining</span>
+                <span className="text-slate-500 block">Elapsed / Remaining</span>
                 <span className="text-cyan-300">
+                  {activeProject.elapsedSeconds !== undefined ? `${Math.round(activeProject.elapsedSeconds)}s / ` : ''}
                   {activeProject.etaSeconds !== null && activeProject.etaSeconds !== undefined && activeProject.etaSeconds > 0
                     ? `${Math.ceil(activeProject.etaSeconds)}s`
-                    : activeProject.status === 'ready'
+                    : lowStatus === 'ready'
                     ? 'Complete'
                     : '--'}
                 </span>
@@ -386,7 +393,7 @@ export const ProcessingView: React.FC = () => {
             <div className="relative aspect-video bg-black flex items-center justify-center group">
               <video
                 ref={videoRef}
-                src={activeProject.localVideoUrl}
+                src={isMediaReady ? activeProject.localVideoUrl : undefined}
                 onTimeUpdate={handleTimeUpdate}
                 onEnded={() => setIsPlaying(false)}
                 className="w-full h-full object-contain"

@@ -7,7 +7,7 @@ from fastapi import APIRouter
 from backend.app import gpu_config
 from backend.app.cleanup import cleanup_storage
 from backend.app.config import settings
-from backend.app.transcription import detect_whisper_hardware, whisper_available
+from backend.app.transcription import TRANSCRIPTION_PROFILES, detect_whisper_hardware, whisper_available
 
 router = APIRouter(prefix="/health", tags=["Health"])
 
@@ -38,6 +38,11 @@ async def get_health():
         "encoder_vendors": enc.get("vendors", {}),
         "whisper": whisper_available(),
         "whisper_model": settings.WHISPER_MODEL,
+        "whisper_profile": settings.WHISPER_PROFILE,
+        "transcription_profiles": {
+            k: {"label": v["label"], "description": v["description"]}
+            for k, v in TRANSCRIPTION_PROFILES.items()
+        },
         "whisper_hardware": detect_whisper_hardware(),
         "yt_dlp": bool(shutil.which("yt-dlp")) or _has_module("yt_dlp"),
         "python_version": sys.version.split()[0],

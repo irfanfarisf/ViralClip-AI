@@ -29,6 +29,7 @@ class ChunkedUploadInitRequest(BaseModel):
     auto_analyze: bool = False
     language: Optional[str] = None
     whisper_model: Optional[str] = None
+    transcription_profile: Optional[str] = None
     gemini_api_key: Optional[str] = None
     openai_api_key: Optional[str] = None
 
@@ -45,6 +46,7 @@ class VideoImportUrlRequest(BaseModel):
     auto_analyze: bool = False
     language: Optional[str] = None
     whisper_model: Optional[str] = None
+    transcription_profile: Optional[str] = None
     gemini_api_key: Optional[str] = None
     openai_api_key: Optional[str] = None
 

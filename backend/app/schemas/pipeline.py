@@ -9,6 +9,7 @@ class AnalyzeRequest(BaseModel):
     video_id: str
     language: Optional[str] = Field(None, description="ISO code, e.g. 'en'. Auto-detect when omitted or set to 'auto'.")
     whisper_model: Optional[str] = Field(None, description="Whisper model, e.g. 'tiny', 'base', 'small', 'medium'. Defaults to server setting.")
+    transcription_profile: Optional[str] = Field(None, description="Performance profile: 'speed' | 'balanced' | 'accuracy'.")
     transcribe: bool = True
     min_clip_seconds: float = Field(20, ge=5, le=120)
     max_clip_seconds: float = Field(45, ge=5, le=180)
